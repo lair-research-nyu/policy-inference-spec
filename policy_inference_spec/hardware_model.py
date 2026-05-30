@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from enum import StrEnum
+import sys
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
 from typing import Any
 
 import numpy as np
@@ -25,6 +33,7 @@ from policy_inference_spec.protocol import (
     PROMPT_KEY,
     ACTION_PREFIX_KEY,
     PREFIX_CHANGE_START_KEY,
+    TIMESTAMP_KEY,
     ServerFeature,
     ServerHandshake,
     make_server_handshake,
@@ -143,8 +152,9 @@ def _optional_wire_inference_request_keys() -> frozenset[str]:
             DUMB_REWARD_THRESHOLD_KEY,
             FAST_MOCK_ACTION_DIM_KEY,
             FAST_MOCK_ACTION_HORIZON_KEY,
-            ACTION_PREFIX_KEY,   
-            PREFIX_CHANGE_START_KEY
+            ACTION_PREFIX_KEY,
+            PREFIX_CHANGE_START_KEY,
+            TIMESTAMP_KEY,
         }
     )
 

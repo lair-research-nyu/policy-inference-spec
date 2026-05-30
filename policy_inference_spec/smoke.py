@@ -6,7 +6,6 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
 import numpy as np
 import simplejpeg  # type: ignore[import-untyped]
@@ -51,7 +50,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 @asynccontextmanager
-async def _smoke_server_url(url: str | None) -> AsyncIterator[str]:
+async def _smoke_server_url(url: str | None):
     if url is not None:
         yield url
         return

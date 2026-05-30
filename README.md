@@ -16,6 +16,12 @@ Optional test dependencies:
 pip install -e '.[dev]'
 ```
 
+Optional debug-tooling dependencies (needed by `scripts/debug_dataset_frame.py`; adds `matplotlib`):
+
+```bash
+pip install -e '.[debug]'
+```
+
 The base install now includes the dependencies needed by both module CLIs:
 
 - `python -m policy_inference_spec.smoke`
@@ -138,6 +144,71 @@ uv run python -m server.minimal --no-rewards
 ```
 
 The CLI defaults to `--action-horizon 50` so it works with `policy_inference_spec.replay_rrd` out of the box. The importable `run_example_server()` helper still defaults to a shorter horizon of `4` unless you override `action_horizon=...`.
+
+### Debug inference server
+
+`server.debug` is a standalone inference server for robot bring-up and policy debugging. It implements the full wire protocol, but instead of running a policy it produces action chunks from a pluggable `ActionSource`, optionally piping them through `ChunkTransform`s, a `Gate` (pacing), and a `ResponseObserver` (introspection). Nothing in this module loads `lerobot` or a checkpoint — it's safe to boot on a machine without a GPU.
+
+```bash
+uv run python -m server.debug --host 127.0.0.1 --port 18090 --source=zeros
+```
+
+Pipeline stages, each independently selectable via CLI flags:
+
+1. **Source** (`--source`): produces the `(H, 25)` action chunk.
+   - `zeros` — all zeros. Smoke-test source.
+   - `rrd` — replay commanded positions from a `.rrd` recording. Needs `--recording-path`, optionally `--schema` (default `gen2-32d-state`) and `--hz` (default `50`). Holds the last chunk when the recording is exhausted. Pose-action schemas are rejected (their action dim is 23, wire requires 25).
+   - `goto` — interpolate linearly from the current commanded pose to a target over the first chunk, then hold. Needs `--target-pose-file` (`.npy` with 25 floats). `--max-step-per-joint-rad` (default `0.5`) aborts if the target is farther than that on any joint; set `<=0` to disable.
+
+2. **Transforms** (applied in the order of their flags):
+   - `--delete-first N` — drop the first `N` actions and back-pad with `chunk[N]` so the chunk length is unchanged. Useful to skip a policy's warm-up actions.
+   - `--set-constant VALUE[,DIM,DIM...]` — pin action dims to `VALUE`. Omit dims to pin every dim; e.g. `--set-constant 0,22,23,24` zeroes only the neck.
+
+3. **Gate** (`--gate`): paces when each response is released.
+   - `none` (default) — release immediately.
+   - `keypress` — pause each response until Enter is pressed in the server terminal. One press = one release (FIFO across waiting connections). Requires a TTY stdin.
+
+4. **Observer** (`--observer`): side-effect sink called after the chunk is produced.
+   - `none` (default) — no-op.
+   - `rerun` — spawn a live Rerun viewer (`rr.spawn()`) that logs all three cameras, right-arm state (`state[32:40]`), and the predicted action chunk (25 dims, each row projected forward at `1/hz` per step). Customize with `--rerun-app-id`.
+
+Other flags: `--action-horizon` (default `50`, matches `server.minimal`), `--hz` (control rate shared by `rrd` source and `rerun` observer).
+
+Examples:
+
+```bash
+# Step through an .rrd recording chunk-by-chunk while watching it in Rerun
+uv run python -m server.debug \
+  --source=rrd --recording-path ~/local_data/recordings/example.rrd \
+  --gate=keypress --observer=rerun
+
+# Slowly drive the robot to a captured pose, skipping the first 10 warm-up actions
+uv run python -m server.debug \
+  --source=goto --target-pose-file ~/poses/ready.npy \
+  --max-step-per-joint-rad 0.3 --delete-first 10
+
+# Zero-action source with the neck pinned to zero, everything else free
+uv run python -m server.debug --source=zeros --set-constant 0,22,23,24
+```
+
+Importable entrypoints:
+
+```python
+from policy_inference_spec.debug import (
+    DeleteAndBackpad,
+    GoToPoseSource,
+    ImmediateGate,
+    KeypressGate,
+    RerunObserver,
+    RrdActionSource,
+    SetConstant,
+    ZerosSource,
+    run_pipeline,
+)
+from server.debug import handle_inference_connection, run_debug_server
+```
+
+Pipeline protocols (`ActionSource`, `ChunkTransform`, `Gate`, `ResponseObserver`) live in `policy_inference_spec.debug.pipeline`; implement any of them to add a new source/transform/gate/observer.
 
 ### Repository helper commands
 
@@ -298,6 +369,8 @@ And the same `camera_stream_schema()` values:
 | `policy_inference_spec.smoke` | CLI smoke test for predict requests |
 | `policy_inference_spec.replay_rrd` | Importable offline replay utilities plus the `.rrd` replay CLI |
 | `server.minimal` | Importable example inference server and example linear policy |
+| `server.debug` | Debug inference server with pluggable action sources, transforms, gates, and observers |
+| `policy_inference_spec.debug` | `ActionSource` / `ChunkTransform` / `Gate` / `ResponseObserver` protocols and their built-in implementations |
 
 ## Quick Checks
 

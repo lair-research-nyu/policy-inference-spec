@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from enum import StrEnum
+import sys
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
 from typing import Any, TypeAlias
 
 import numpy as np
@@ -29,6 +37,7 @@ REWARDS_H_KEY = "rewards_h"
 ACTION_PREFIX_KEY = "action_prefix"
 PREFIX_CHANGE_START_KEY = "prefix_change_start"
 REWARD_DESCRIPTION_KEY = "description"
+TIMESTAMP_KEY = "timestamp"
 
 CAMERA_NAMES_KEY = "camera_names"
 IMAGE_RESOLUTION_KEY = "image_resolution"
