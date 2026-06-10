@@ -17,6 +17,7 @@ dependencies = [
     "rerun-sdk[all]==0.30.2",
     "typer==0.12.*",
     "click<8.2.0",
+    "h5py>=3.10",
 ]
 
 [project.optional-dependencies]

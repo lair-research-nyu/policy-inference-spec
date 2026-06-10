@@ -212,3 +212,7 @@ data/
 CLAUDE.md
 
 .vscode
+
+output/
+eval-rrd/
+.DS_Store
