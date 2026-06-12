@@ -121,6 +121,9 @@ POLICY_ID: str | None = None
 _DATASET_STATS: dict | None = None
 _PREPROCESSOR: Any = None
 _POSTPROCESSOR: Any = None
+# When True, the 25-dim state sent to the policy is zeroed. Must match training:
+# use with checkpoints trained on a zero-state dataset (zero_state_dataset.py).
+ZERO_STATE: bool = False
 
 
 def _load_policy(checkpoint_path: Path, policy_type: str):
@@ -218,6 +221,8 @@ def _inference_response(
         raw_state[64:70],
         raw_state[88:91],
     ])
+    if ZERO_STATE:
+        state_25 = np.zeros_like(state_25)
     raw_state_hash = _hash_bytes(raw_state.tobytes())
     image_fingerprints = " ".join(
         f"{wire_key.rsplit('/', 1)[-1]}={_image_fingerprint(frame[wire_key])}"
@@ -380,6 +385,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Send one full action chunk per connection, then stop responding to further requests.",
     )
+    parser.add_argument(
+        "--zero-state",
+        action="store_true",
+        help="Zero the 25-dim state before inference. Use with checkpoints trained "
+             "on a zero-state dataset (zero_state_dataset.py).",
+    )
     return parser.parse_args(argv)
 
 
@@ -390,8 +401,12 @@ def _cli_server_features(no_rewards: bool) -> tuple[ServerFeature, ...]:
 
 
 async def _run_cli(argv: Sequence[str] | None = None) -> int:
+    global ZERO_STATE
     args = _parse_args(argv)
     assert args.action_horizon >= 1, f"action_horizon must be positive, got {args.action_horizon}"
+    ZERO_STATE = args.zero_state
+    if ZERO_STATE:
+        print("ZERO-STATE mode: state_25 is zeroed before inference", flush=True)
     server_features = _cli_server_features(args.no_rewards)
     logging.basicConfig(
         level=logging.INFO,
