@@ -216,3 +216,4 @@ CLAUDE.md
 output/
 eval-rrd/
 .DS_Store
+.claude/

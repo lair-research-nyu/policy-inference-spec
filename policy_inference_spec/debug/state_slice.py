@@ -5,7 +5,7 @@ floats. A source that wants to produce actions "relative to the current
 commanded pose" (e.g. GoToPoseSource) needs to extract the 25 commanded
 positions from the 97-dim state vector.
 
-The slicing convention mirrors ``server/minimal.py::_inference_response``:
+The slicing convention mirrors ``server/server.py::_inference_response``:
 
     left_arm  = state[0:8]     # 7 joints + 1 gripper
     right_arm = state[32:40]   # 7 joints + 1 gripper

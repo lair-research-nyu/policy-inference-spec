@@ -7,7 +7,7 @@ What it does:
        action trajectory.
     2. Decodes the three camera streams at that frame's timestamp.
     3. Synthesizes the 97-dim wire state by placing the dataset's 25-dim
-       commanded positions into the same slices server.minimal reads from.
+       commanded positions into the same slices server.server reads from.
     4. Sends the request to a policy server (--predict-url) and receives a
        (H, 25) predicted action chunk.
     5. Plots one matplotlib window with:
@@ -20,7 +20,7 @@ What it does:
       color so their alignment is obvious.
 
 Run the minimal server first (loads the policy into GPU):
-    uv run python -m server.minimal --host 127.0.0.1 --port 18090
+    uv run python -m server.server --host 127.0.0.1 --port 18090
 
 Then:
     uv run python scripts/debug_dataset_frame.py --episode-index 0 --frame-index 50
@@ -56,7 +56,7 @@ DEFAULT_PREDICT_URL = f"ws://127.0.0.1:{DEFAULT_INFERENCE_SERVER_PORT}/ws"
 DATASET_FPS = 50
 _WIRE_STATE_DIM = 97
 
-# 25-dim action/state layout (same in both). Matches server.minimal's slicing.
+# 25-dim action/state layout (same in both). Matches server.server's slicing.
 _BODY_PARTS: tuple[tuple[str, int, int], ...] = (
     ("left_arm", 0, 8),
     ("right_arm", 8, 16),
@@ -64,7 +64,7 @@ _BODY_PARTS: tuple[tuple[str, int, int], ...] = (
     ("neck", 22, 25),
 )
 # Mapping from dataset 25-dim into 97-dim wire state (inverse of
-# server.minimal._inference_response slicing).
+# server.server._inference_response slicing).
 _WIRE_STATE_INJECT: tuple[tuple[slice, slice], ...] = (
     (slice(0, 8), slice(0, 8)),       # left_arm
     (slice(32, 40), slice(8, 16)),    # right_arm

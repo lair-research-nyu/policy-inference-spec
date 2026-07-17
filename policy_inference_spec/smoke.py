@@ -13,7 +13,7 @@ import simplejpeg  # type: ignore[import-untyped]
 from policy_inference_spec.client import RemotePolicyClient
 from policy_inference_spec.hardware_model import DEFAULT_HARDWARE_MODEL
 from policy_inference_spec.protocol import JOINT_STATE_KEY, MODEL_ID_KEY, PROMPT_KEY
-from server.minimal import run_example_server
+from server.server import run_example_server
 
 
 def _random_predict_frame() -> dict[str, object]:
