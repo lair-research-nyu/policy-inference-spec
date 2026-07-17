@@ -16,7 +16,7 @@ from policy_inference_spec.protocol import (
     PROMPT_KEY,
     ServerFeature,
 )
-from server.minimal import (
+from server.server import (
     EXAMPLE_POLICY_ID,
     _cli_server_features,
     _parse_args,

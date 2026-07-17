@@ -36,7 +36,7 @@ The base install now includes the dependencies needed by both module CLIs:
 - Purpose: send a few predict requests to a policy server.
 - CLI: `python -m policy_inference_spec.smoke`
 - Behavior:
-  - if `--url` is omitted, it starts the in-process example server from `server.minimal`
+  - if `--url` is omitted, it starts the in-process example server from `server.server`
   - sends randomly generated Gen2-compatible requests
   - optionally forwards an `x-api-key` header
 - Flags:
@@ -125,7 +125,7 @@ from policy_inference_spec.replay_rrd import (
 Example server helpers live in the sibling `server` package:
 
 ```python
-from server.minimal import (
+from server.server import (
     example_policy_actions,
     handle_inference_connection,
     main,
@@ -134,13 +134,13 @@ from server.minimal import (
 )
 ```
 
-`server.minimal` is both importable and runnable as a module:
+`server.server` is both importable and runnable as a module:
 
 ```bash
-uv run python -m server.minimal
-uv run python -m server.minimal --host 127.0.0.1 --port 18090
-uv run python -m server.minimal --host 127.0.0.1 --port 18090 --action-horizon 50
-uv run python -m server.minimal --no-rewards
+uv run python -m server.server
+uv run python -m server.server --host 127.0.0.1 --port 18090
+uv run python -m server.server --host 127.0.0.1 --port 18090 --action-horizon 50
+uv run python -m server.server --no-rewards
 ```
 
 The CLI defaults to `--action-horizon 50` so it works with `policy_inference_spec.replay_rrd` out of the box. The importable `run_example_server()` helper still defaults to a shorter horizon of `4` unless you override `action_horizon=...`.
@@ -172,7 +172,7 @@ Pipeline stages, each independently selectable via CLI flags:
    - `none` (default) — no-op.
    - `rerun` — spawn a live Rerun viewer (`rr.spawn()`) that logs all three cameras, right-arm state (`state[32:40]`), and the predicted action chunk (25 dims, each row projected forward at `1/hz` per step). Customize with `--rerun-app-id`.
 
-Other flags: `--action-horizon` (default `50`, matches `server.minimal`), `--hz` (control rate shared by `rrd` source and `rerun` observer).
+Other flags: `--action-horizon` (default `50`, matches `server.server`), `--hz` (control rate shared by `rrd` source and `rerun` observer).
 
 Examples:
 
@@ -316,7 +316,7 @@ Optional response fields:
   - `{"endpoint": "reward", "reward": <float>}`
   - optionally with `{"description": <str>}`
 - The example server acknowledges rewards with `{"endpoint": "reward", "status": "ok", ...}`.
-- `ENDPOINT_RESET` and `ENDPOINT_TELEMETRY` constants exist, and `server.minimal` replies to both with `{"status": "ok"}`.
+- `ENDPOINT_RESET` and `ENDPOINT_TELEMETRY` constants exist, and `server.server` replies to both with `{"status": "ok"}`.
 - There are no dedicated reset or telemetry client helpers in this package.
 
 ### Msgpack / NumPy codec
@@ -368,7 +368,7 @@ And the same `camera_stream_schema()` values:
 | `policy_inference_spec.feature_engineering` | Feature-bundle schemas, action parsing, and image preprocessing utilities |
 | `policy_inference_spec.smoke` | CLI smoke test for predict requests |
 | `policy_inference_spec.replay_rrd` | Importable offline replay utilities plus the `.rrd` replay CLI |
-| `server.minimal` | Importable example inference server and example linear policy |
+| `server.server` | Importable example inference server and example linear policy |
 | `server.debug` | Debug inference server with pluggable action sources, transforms, gates, and observers |
 | `policy_inference_spec.debug` | `ActionSource` / `ChunkTransform` / `Gate` / `ResponseObserver` protocols and their built-in implementations |
 
@@ -397,7 +397,7 @@ uv run python -m policy_inference_spec.replay_rrd \
 Run the minimal example server in another terminal:
 
 ```bash
-uv run python -m server.minimal --host 127.0.0.1 --port 18090
+uv run python -m server.server --host 127.0.0.1 --port 18090
 ```
 
 ## License
