@@ -36,7 +36,7 @@ The base install now includes the dependencies needed by both module CLIs:
 - Purpose: send a few predict requests to a policy server.
 - CLI: `python -m policy_inference_spec.smoke`
 - Behavior:
-  - if `--url` is omitted, it starts the in-process example server from `server.server`
+  - if `--url` is omitted, it starts the in-process example server from `server.minimal`
   - sends randomly generated Gen2-compatible requests
   - optionally forwards an `x-api-key` header
 - Flags:
@@ -70,6 +70,8 @@ uv run python -m policy_inference_spec.smoke --url ws://127.0.0.1:18090/ws --pre
   - `--hz`
   - `--prediction-hz`
   - `--max-samples`
+  - `--action-prefix-steps`
+  - `--prefix-change-start`
 
 Examples:
 
@@ -96,7 +98,6 @@ from policy_inference_spec import (
     DEFAULT_HARDWARE_MODEL,
     DEFAULT_PREDICT_URL,
     RemotePolicyClient,
-    RewardSignal,
     ServerFeature,
     ServerHandshake,
     deserialize_from_msgpack,
@@ -125,7 +126,7 @@ from policy_inference_spec.replay_rrd import (
 Example server helpers live in the sibling `server` package:
 
 ```python
-from server.server import (
+from server.minimal import (
     example_policy_actions,
     handle_inference_connection,
     main,
@@ -134,13 +135,13 @@ from server.server import (
 )
 ```
 
-`server.server` is both importable and runnable as a module:
+`server.minimal` is both importable and runnable as a module:
 
 ```bash
-uv run python -m server.server
-uv run python -m server.server --host 127.0.0.1 --port 18090
-uv run python -m server.server --host 127.0.0.1 --port 18090 --action-horizon 50
-uv run python -m server.server --no-rewards
+uv run python -m server.minimal
+uv run python -m server.minimal --host 127.0.0.1 --port 18090
+uv run python -m server.minimal --host 127.0.0.1 --port 18090 --action-horizon 50
+uv run python -m server.minimal --no-rewards
 ```
 
 The CLI defaults to `--action-horizon 50` so it works with `policy_inference_spec.replay_rrd` out of the box. The importable `run_example_server()` helper still defaults to a shorter horizon of `4` unless you override `action_horizon=...`.
@@ -172,7 +173,7 @@ Pipeline stages, each independently selectable via CLI flags:
    - `none` (default) — no-op.
    - `rerun` — spawn a live Rerun viewer (`rr.spawn()`) that logs all three cameras, right-arm state (`state[32:40]`), and the predicted action chunk (25 dims, each row projected forward at `1/hz` per step). Customize with `--rerun-app-id`.
 
-Other flags: `--action-horizon` (default `50`, matches `server.server`), `--hz` (control rate shared by `rrd` source and `rerun` observer).
+Other flags: `--action-horizon` (default `50`, matches `server.minimal`), `--hz` (control rate shared by `rrd` source and `rerun` observer).
 
 Examples:
 
@@ -263,23 +264,36 @@ Only `HardwareModel.GEN2` is modeled in this package.
 
 ### Inference request validation
 
-`validate_wire_inference_request_frame()` requires the request keys to match exactly:
+`validate_wire_inference_request_frame()` requires these base request keys:
 
 - `observation/state`
 - `observation/images/main_image`
 - `observation/images/left_wrist_image`
 - `observation/images/right_wrist_image`
-- `prompt`
+- `task`
+- `subtask`
 - `model_id`
 
 Current validation rules:
 
 - `endpoint` must not be present on inference frames.
-- `prompt` must be `str`.
+- `task` must be `str`.
+- `subtask` must be `str`.
 - `model_id` must be `str`.
 - `observation/state` must be a 1-D `numpy.ndarray` with shape `(97,)`.
 - Each image field must be either JPEG `bytes` or a `numpy.ndarray`.
-- Extra keys are rejected.
+- Extra keys are rejected except the optional request fields below.
+
+Optional request fields:
+
+- `observation/images/table_view_image`: optional station hardware camera. JPEG `bytes` or `numpy.ndarray`. May be omitted when the station has no table-view cam.
+- `action_prefix`: floating 2-D `numpy.ndarray` shaped `(prefix_steps, 25)`. It carries only real prefix actions; clients must not pad it to the full policy horizon.
+- `prefix_change_start`: non-negative `int`. Required when `action_prefix` is present. In replay tooling this defaults to `--action-prefix-steps` unless `--prefix-change-start` is set.
+- `reward`, `done`, `done_reason`, `prev_skipped_action_start`
+- `start_metadata`, `conditioning_metadata`
+- `observation/hidden`, `observation/env`
+- `dumb_reward_goal_action_chunk` plus `dumb_reward_threshold`: optional debugging/reward fields.
+- `fast_mock_action_dim` plus `fast_mock_action_horizon`: optional testing fields.
 
 `RemotePolicyClient.predict()` accepts image arrays in HWC or single-item BHWC `uint8` form and JPEG-encodes them at quality 75 before sending. It does not resize them.
 
@@ -294,30 +308,29 @@ Current validation rules:
 `validate_wire_inference_response()` requires:
 
 - `action`: a 2-D floating `numpy.ndarray` whose second dimension is `25`
-- `context_embeddings`: a floating `numpy.ndarray` with shape `(2, 128)`
 
 Optional response fields:
 
 - `inference_time`: numeric
 - `policy_id`: `str`
+- `rl_enabled`: `bool`, whether the returned action chunk used the RL actor
+- `q_value`: numeric, critic Q estimate for the returned action chunk when available
 
 `RemotePolicyClient.predict()` returns `RemotePolicyPrediction`:
 
 - `actions_d`
-- `context_embeddings`
 - `total_latency_ms`
 - `policy_id`
+- `rl_enabled`
+- `q_value`
 
 ### Reward and control messages
 
-- `RemotePolicyClient.reward()` only sends a reward frame if the server handshake advertises `"rewards"`.
-- If reward support is not advertised, the client logs a warning and drops the message.
-- `RewardSignal.to_payload()` produces:
-  - `{"endpoint": "reward", "reward": <float>}`
-  - optionally with `{"description": <str>}`
-- The example server acknowledges rewards with `{"endpoint": "reward", "status": "ok", ...}`.
-- `ENDPOINT_RESET` and `ENDPOINT_TELEMETRY` constants exist, and `server.server` replies to both with `{"status": "ok"}`.
-- There are no dedicated reset or telemetry client helpers in this package.
+- `RemotePolicyClient.predict(..., reward=<float>, done=True, done_reason=<str>)` includes scalar rewards and terminal markers in the inference request when the server handshake advertises `"rewards"`.
+- If reward support is not advertised, the client logs a warning and drops the reward.
+- `ENDPOINT_DONE` and `ENDPOINT_TELEMETRY` constants exist, and `server.minimal` replies to both with `{"status": "ok"}`.
+- `ENDPOINT_DONE` marks the current episode as done on the server (it does not reset any gym environment); `RemotePolicyClient.mark_episode_done(done_reason)` sends it over the live connection.
+- There is no dedicated telemetry client helper in this package.
 
 ### Msgpack / NumPy codec
 
@@ -368,7 +381,8 @@ And the same `camera_stream_schema()` values:
 | `policy_inference_spec.feature_engineering` | Feature-bundle schemas, action parsing, and image preprocessing utilities |
 | `policy_inference_spec.smoke` | CLI smoke test for predict requests |
 | `policy_inference_spec.replay_rrd` | Importable offline replay utilities plus the `.rrd` replay CLI |
-| `server.server` | Importable example inference server and example linear policy |
+| `server.minimal` | Importable example inference server and example linear policy |
+| `server.server` | LeRobot-backed inference server (loads a checkpoint and runs a real policy) |
 | `server.debug` | Debug inference server with pluggable action sources, transforms, gates, and observers |
 | `policy_inference_spec.debug` | `ActionSource` / `ChunkTransform` / `Gate` / `ResponseObserver` protocols and their built-in implementations |
 
@@ -397,7 +411,7 @@ uv run python -m policy_inference_spec.replay_rrd \
 Run the minimal example server in another terminal:
 
 ```bash
-uv run python -m server.server --host 127.0.0.1 --port 18090
+uv run python -m server.minimal --host 127.0.0.1 --port 18090
 ```
 
 ## License

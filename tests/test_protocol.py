@@ -11,22 +11,25 @@ from beartype.roar import BeartypeCallHintParamViolation
 from policy_inference_spec.codec import NdarrayField, deserialize_from_msgpack, encode_image, serialize_to_msgpack
 from policy_inference_spec.protocol import (
     ACTION_KEY,
-    CONTEXT_EMBEDDINGS_KEY,
-    CONTEXT_EMBEDDING_TOKENS,
-    CONTEXT_EMBEDDING_WIDTH,
-    DUMB_REWARD_GOAL_ACTION_CHUNK_KEY,
-    DUMB_REWARD_THRESHOLD_KEY,
-    ENDPOINT_KEY,
-    ENDPOINT_REWARD,
+    CONDITIONING_METADATA_KEY,
     FloatArray,
     ProtocolPayload,
-    REWARD_DESCRIPTION_KEY,
-    REWARDS_H_KEY,
-    RewardSignal,
+    JOINT_STATE_KEY,
+    MODEL_ID_KEY,
+    REWARD_ACTION_INDEX_KEY,
+    REWARD_KEY,
+    START_METADATA_KEY,
+    SUBTASK_KEY,
+    TABLE_VIEW_IMAGE_KEY,
+    TASK_KEY,
     ServerFeature,
     ServerHandshake,
 )
-from policy_inference_spec.hardware_model import validate_wire_inference_response
+from policy_inference_spec.hardware_model import (
+    DEFAULT_HARDWARE_MODEL,
+    validate_wire_inference_request_frame,
+    validate_wire_inference_response,
+)
 
 
 def test_serialize_to_msgpack_uses_flat_ndarray_tags() -> None:
@@ -91,7 +94,6 @@ def test_validate_wire_inference_response_summarizes_binary_like_payloads() -> N
                     "dtype": "float64",
                     "shape": [2, 2],
                 },
-                CONTEXT_EMBEDDINGS_KEY: np.zeros((CONTEXT_EMBEDDING_TOKENS, CONTEXT_EMBEDDING_WIDTH), dtype=np.float32),
             }
         )
 
@@ -99,18 +101,6 @@ def test_validate_wire_inference_response_summarizes_binary_like_payloads() -> N
     assert "summary=" in message
     assert "dict(keys=['__ndarray__', 'data', 'dtype', 'shape'])" in message
     assert "\\x00" not in message
-
-
-def test_validate_wire_inference_response_accepts_context_embeddings() -> None:
-    validate_wire_inference_response(
-        {
-            ACTION_KEY: np.zeros((2, 25), dtype=np.float32),
-            CONTEXT_EMBEDDINGS_KEY: np.zeros(
-                (CONTEXT_EMBEDDING_TOKENS, CONTEXT_EMBEDDING_WIDTH),
-                dtype=np.float32,
-            ),
-        }
-    )
 
 
 def test_encode_image_preserves_original_shape_metadata() -> None:
@@ -140,26 +130,155 @@ def test_server_handshake_round_trip_preserves_server_features() -> None:
     assert decoded.supports(ServerFeature.REWARDS)
 
 
-def test_reward_signal_round_trip_with_optional_description() -> None:
-    reward_signal = RewardSignal((1.5, 0.0), "The box was successfully sealed")
-
-    assert RewardSignal.from_payload(reward_signal.to_payload()) == reward_signal
-    assert reward_signal.to_payload() == {
-        ENDPOINT_KEY: ENDPOINT_REWARD,
-        REWARDS_H_KEY: [1.5, 0.0],
-        REWARD_DESCRIPTION_KEY: "The box was successfully sealed",
-    }
-
-
-def test_serialize_to_msgpack_accepts_optional_dumb_reward_goal_chunk_and_threshold() -> None:
+def test_validate_wire_inference_request_frame_accepts_optional_table_view_image() -> None:
     payload: ProtocolPayload = {
-        DUMB_REWARD_GOAL_ACTION_CHUNK_KEY: np.zeros((2, 25), dtype=np.float32),
-        DUMB_REWARD_THRESHOLD_KEY: 0.25,
+        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
+        TASK_KEY: "",
+        SUBTASK_KEY: "",
+        MODEL_ID_KEY: "",
+        TABLE_VIEW_IMAGE_KEY: np.zeros((300, 480, 3), dtype=np.uint8),
     }
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
 
-    decoded = deserialize_from_msgpack(serialize_to_msgpack(payload))
+    validate_wire_inference_request_frame(payload)
 
-    decoded_goal_action_chunk_hd = decoded[DUMB_REWARD_GOAL_ACTION_CHUNK_KEY]
-    assert isinstance(decoded_goal_action_chunk_hd, np.ndarray)
-    assert decoded_goal_action_chunk_hd.shape == (2, 25)
-    assert decoded[DUMB_REWARD_THRESHOLD_KEY] == pytest.approx(0.25)
+
+def test_validate_wire_inference_request_frame_accepts_missing_table_view_image() -> None:
+    payload: ProtocolPayload = {
+        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
+        TASK_KEY: "",
+        SUBTASK_KEY: "",
+        MODEL_ID_KEY: "",
+    }
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
+
+    validate_wire_inference_request_frame(payload)
+    assert TABLE_VIEW_IMAGE_KEY not in payload
+
+
+def test_validate_wire_inference_request_frame_accepts_scalar_reward() -> None:
+    payload: ProtocolPayload = {
+        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
+        TASK_KEY: "",
+        SUBTASK_KEY: "",
+        MODEL_ID_KEY: "",
+        REWARD_KEY: 1.25,
+    }
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
+
+    validate_wire_inference_request_frame(payload)
+
+
+def test_validate_wire_inference_request_frame_accepts_reward_action_index() -> None:
+    payload: ProtocolPayload = {
+        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
+        TASK_KEY: "",
+        SUBTASK_KEY: "",
+        MODEL_ID_KEY: "",
+        REWARD_KEY: 1.25,
+        REWARD_ACTION_INDEX_KEY: 12,
+    }
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
+
+    validate_wire_inference_request_frame(payload)
+
+
+def test_validate_wire_inference_request_frame_rejects_out_of_range_reward_action_index() -> None:
+    payload: ProtocolPayload = {
+        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
+        TASK_KEY: "",
+        SUBTASK_KEY: "",
+        MODEL_ID_KEY: "",
+        REWARD_ACTION_INDEX_KEY: 50,
+    }
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
+
+    with pytest.raises(AssertionError, match=REWARD_ACTION_INDEX_KEY):
+        validate_wire_inference_request_frame(payload)
+
+
+def test_validate_wire_inference_request_frame_accepts_start_metadata() -> None:
+    payload: ProtocolPayload = {
+        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
+        TASK_KEY: "bulk_shipping",
+        SUBTASK_KEY: "pick_item",
+        START_METADATA_KEY: {
+            "item_index": 2,
+            "pick_location": "table",
+            "nested": {"drop_off_location": "Blue Bin"},
+        },
+        MODEL_ID_KEY: "",
+    }
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
+
+    validate_wire_inference_request_frame(payload)
+
+
+def test_validate_wire_inference_request_frame_accepts_conditioning_metadata() -> None:
+    payload: ProtocolPayload = {
+        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
+        TASK_KEY: "bulk_shipping",
+        SUBTASK_KEY: "pick_item",
+        CONDITIONING_METADATA_KEY: {
+            "operator_ldap": "operator",
+            "post_hoc_score": 4,
+            "mistake": "false",
+            "episode_length": 1200,
+        },
+        MODEL_ID_KEY: "",
+    }
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
+
+    validate_wire_inference_request_frame(payload)
+
+
+def test_validate_wire_inference_request_frame_rejects_non_numeric_reward() -> None:
+    payload: ProtocolPayload = {
+        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
+        TASK_KEY: "",
+        SUBTASK_KEY: "",
+        MODEL_ID_KEY: "",
+        REWARD_KEY: "1.25",
+    }
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
+
+    with pytest.raises(AssertionError, match=REWARD_KEY):
+        validate_wire_inference_request_frame(payload)
+
+
+def test_validate_wire_inference_request_frame_rejects_non_json_start_metadata() -> None:
+    payload: ProtocolPayload = {
+        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
+        TASK_KEY: "bulk_shipping",
+        SUBTASK_KEY: "pick_item",
+        START_METADATA_KEY: {"bad": object()},
+        MODEL_ID_KEY: "",
+    }
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
+
+    with pytest.raises(AssertionError, match=START_METADATA_KEY):
+        validate_wire_inference_request_frame(payload)
+
+
+def test_validate_wire_inference_request_frame_rejects_non_json_conditioning_metadata() -> None:
+    payload: ProtocolPayload = {
+        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
+        TASK_KEY: "bulk_shipping",
+        SUBTASK_KEY: "pick_item",
+        CONDITIONING_METADATA_KEY: {"bad": object()},
+        MODEL_ID_KEY: "",
+    }
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
+
+    with pytest.raises(AssertionError, match=CONDITIONING_METADATA_KEY):
+        validate_wire_inference_request_frame(payload)

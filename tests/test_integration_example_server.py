@@ -8,15 +8,13 @@ from typing import Any, cast
 from policy_inference_spec.client import RemotePolicyClient
 from policy_inference_spec.hardware_model import DEFAULT_HARDWARE_MODEL
 from policy_inference_spec.protocol import (
-    CONTEXT_EMBEDDINGS_KEY,
-    CONTEXT_EMBEDDING_TOKENS,
-    CONTEXT_EMBEDDING_WIDTH,
     JOINT_STATE_KEY,
     MODEL_ID_KEY,
-    PROMPT_KEY,
+    SUBTASK_KEY,
+    TASK_KEY,
     ServerFeature,
 )
-from server.server import (
+from server.minimal import (
     EXAMPLE_POLICY_ID,
     _cli_server_features,
     _parse_args,
@@ -33,7 +31,8 @@ def _random_predict_frame() -> dict[str, object]:
     height, width = DEFAULT_HARDWARE_MODEL.image_resolution
     frame: dict[str, object] = {
         JOINT_STATE_KEY: rng.standard_normal(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
-        PROMPT_KEY: "",
+        TASK_KEY: "",
+        SUBTASK_KEY: "",
         MODEL_ID_KEY: "",
     }
     for cam in DEFAULT_HARDWARE_MODEL.cameras:
@@ -53,9 +52,6 @@ async def test_client_predict_against_example_server() -> None:
     expected = example_policy_actions(cast(np.ndarray[Any, Any], frame[JOINT_STATE_KEY]))
     assert pred.actions_d.shape == expected.shape
     assert pred.actions_d.dtype == np.float32
-    assert pred.context_embeddings.shape == (CONTEXT_EMBEDDING_TOKENS, CONTEXT_EMBEDDING_WIDTH)
-    assert isinstance(pred.context_embeddings, np.ndarray)
-    assert np.array_equal(pred.context_embeddings[-1], np.eye(CONTEXT_EMBEDDING_WIDTH, dtype=np.float32)[-1])
     assert np.allclose(pred.actions_d, expected)
     assert pred.policy_id == EXAMPLE_POLICY_ID
 
@@ -63,22 +59,24 @@ async def test_client_predict_against_example_server() -> None:
         assert np.allclose(pred.actions_d[i + 1, :], pred.actions_d[i, :]), "linear demo policy repeats each action row"
 
 
-async def test_client_reward_round_trip_against_example_server() -> None:
+async def test_client_sends_inline_reward_against_example_server() -> None:
+    frame = _random_predict_frame()
     async with run_example_server() as url:
         client = RemotePolicyClient(url)
         async with client:
-            await client.reward([1.5], "The box was successfully sealed")
+            await client.predict(frame, reward=1.5)
             assert client._server_config == server_handshake_config(server_features=(ServerFeature.REWARDS,))
 
 
-async def test_client_reward_is_dropped_when_example_server_does_not_advertise_rewards(
+async def test_client_inline_reward_is_dropped_when_example_server_does_not_advertise_rewards(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    frame = _random_predict_frame()
     async with run_example_server(server_features=()) as url:
         client = RemotePolicyClient(url)
         async with client:
             with caplog.at_level("WARNING", logger="policy_inference_spec.client"):
-                await client.reward([1.5], "ignored")
+                await client.predict(frame, reward=1.5)
 
     assert "Dropping reward because server does not advertise rewards support" in caplog.text
 

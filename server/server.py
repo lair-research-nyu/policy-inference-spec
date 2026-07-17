@@ -44,24 +44,19 @@ from policy_inference_spec.hardware_model import (
 from policy_inference_spec.protocol import (
     ACTION_KEY,
     ACTION_PREFIX_KEY,
-    CONTEXT_EMBEDDINGS_KEY,
-    CONTEXT_EMBEDDING_TOKENS,
-    CONTEXT_EMBEDDING_WIDTH,
     DEFAULT_INFERENCE_SERVER_PORT,
+    ENDPOINT_DONE,
     ENDPOINT_KEY,
-    ENDPOINT_RESET,
-    ENDPOINT_REWARD,
     ENDPOINT_TELEMETRY,
     INFERENCE_TIME_KEY,
     JOINT_STATE_KEY,
     MODEL_ID_KEY,
     POLICY_ID_KEY,
     PREFIX_CHANGE_START_KEY,
-    PROMPT_KEY,
-    REWARD_DESCRIPTION_KEY,
-    REWARDS_H_KEY,
+    Q_VALUE_KEY,
     STATUS_KEY,
-    RewardSignal,
+    SUBTASK_KEY,
+    TASK_KEY,
     ServerFeature,
     ServerHandshake,
 )
@@ -573,19 +568,13 @@ def _inference_response(
         req_id, action_0_str, action_last_str, delta_first,
     )
 
-    context_embeddings = np.zeros(
-        (CONTEXT_EMBEDDING_TOKENS, CONTEXT_EMBEDDING_WIDTH), dtype=np.float32
-    )
     resp = {
         ACTION_KEY: action,
-        CONTEXT_EMBEDDINGS_KEY: context_embeddings,
         INFERENCE_TIME_KEY: inference_time_s,
         POLICY_ID_KEY: POLICY_ID,
+        Q_VALUE_KEY: 0.0,
     }
     validate_wire_inference_response(resp)
-    # The robot client rejects responses with keys outside
-    # {action, policy_id, inference_time, q_value, rl_enabled}; ours are zeros anyway.
-    del resp[CONTEXT_EMBEDDINGS_KEY]
     return resp
 
 
@@ -604,7 +593,8 @@ async def handle_inference_connection(
     await connection.send(serialize_to_msgpack(cfg.to_payload()))
 
     # Per-connection state: a new robot episode opens a fresh connection (or
-    # sends ENDPOINT_RESET), and must not inherit the previous chunk.
+    # sends ENDPOINT_DONE at the end of the prior one), and must not inherit
+    # the previous chunk.
     rtc_state = _RtcState()
     ensemble_buffer = (
         TemporalEnsembleBuffer(action_horizon, DEFAULT_HARDWARE_MODEL.action_dim, temporal_ensemble_coeff)
@@ -618,7 +608,9 @@ async def handle_inference_connection(
         if not isinstance(frame, dict):
             await connection.send(serialize_to_msgpack({"error": "expected dict frame"}))
             continue
-        if frame.get(ENDPOINT_KEY) == ENDPOINT_RESET:
+        if frame.get(ENDPOINT_KEY) == ENDPOINT_DONE:
+            # Episode finished on the robot: reset per-connection policy state so a
+            # subsequent episode does not inherit the previous chunk.
             POLICY.reset()
             _PREPROCESSOR.reset()
             _POSTPROCESSOR.reset()
@@ -630,36 +622,15 @@ async def handle_inference_connection(
         if frame.get(ENDPOINT_KEY) == ENDPOINT_TELEMETRY:
             await connection.send(serialize_to_msgpack({"status": "ok"}))
             continue
-        if frame.get(ENDPOINT_KEY) == ENDPOINT_REWARD:
-            reward_signal = RewardSignal.from_payload(frame)
-            await connection.send(
-                serialize_to_msgpack(
-                    {
-                        ENDPOINT_KEY: ENDPOINT_REWARD,
-                        STATUS_KEY: "ok",
-                        REWARDS_H_KEY: list(reward_signal.rewards_h),
-                        **(
-                            {REWARD_DESCRIPTION_KEY: reward_signal.description}
-                            if reward_signal.description is not None
-                            else {}
-                        ),
-                    }
-                )
-            )
-            continue
         if ENDPOINT_KEY in frame:
-            # Endpoint we don't implement (e.g. episode-done); ack so the client keeps going.
+            # Endpoint we don't implement; ack so the client keeps going.
             LOGGER.info("ignoring unhandled endpoint %r keys=%s", frame[ENDPOINT_KEY], sorted(frame))
             await connection.send(serialize_to_msgpack({STATUS_KEY: "ok"}))
             continue
-        # Newer robot clients send task/subtask/start_metadata instead of prompt.
-        if PROMPT_KEY not in frame and "task" in frame:
-            frame[PROMPT_KEY] = str(frame.pop("task"))
-        frame.pop("subtask", None)
-        frame.pop("start_metadata", None)
         validate_wire_inference_request_frame(frame)
         _ = frame[MODEL_ID_KEY]
-        prompt = task if task is not None else frame[PROMPT_KEY]
+        _ = frame[SUBTASK_KEY]
+        prompt = task if task is not None else frame[TASK_KEY]
         resp = _inference_response(
             frame,
             rtc_state,
