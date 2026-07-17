@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from policy_inference_spec.protocol import DEFAULT_INFERENCE_SERVER_PORT, JOINT_STATE_KEY, MODEL_ID_KEY, PROMPT_KEY, ServerHandshake
+from policy_inference_spec.protocol import DEFAULT_INFERENCE_SERVER_PORT, JOINT_STATE_KEY, ServerHandshake
 from policy_inference_spec.hardware_model import (
     DEFAULT_HARDWARE_MODEL,
     HardwareModel,

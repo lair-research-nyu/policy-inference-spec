@@ -23,7 +23,15 @@ from policy_inference_spec.feature_engineering import (
     get_feature_bundle_for_schema,
     preprocess_image,
 )
-from policy_inference_spec.protocol import DEFAULT_INFERENCE_SERVER_PORT, JOINT_STATE_KEY, MODEL_ID_KEY, PROMPT_KEY
+from policy_inference_spec.protocol import (
+    ACTION_PREFIX_KEY,
+    DEFAULT_INFERENCE_SERVER_PORT,
+    JOINT_STATE_KEY,
+    MODEL_ID_KEY,
+    PREFIX_CHANGE_START_KEY,
+    SUBTASK_KEY,
+    TASK_KEY,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,7 +40,8 @@ DEFAULT_RECORDING_PATH = Path(
 ).expanduser()
 DEFAULT_OUTPUT_PATH = Path("output.rrd")
 DEFAULT_POLICY_ID = "ultra-ai/bc-nextgen-v0/just-rings-bigger-3:v24"
-DEFAULT_PROMPT = "tower_stack_unstack;stack rings"
+DEFAULT_TASK = "tower_stack_unstack"
+DEFAULT_SUBTASK = "stack_rings"
 DEFAULT_PREDICT_URL = f"ws://127.0.0.1:{DEFAULT_INFERENCE_SERVER_PORT}/ws"
 RERUN_APP_ID = "offline_policy_eval_predictions"
 IMAGE_STREAMS = ("head", "left_wrist", "right_wrist")
@@ -87,13 +96,9 @@ class RerunReplayer:
         self.segment_id = self.rerun_dataset.segment_ids()[0]
         all_features = [*feature_bundle.observations, *feature_bundle.actions, *feature_bundle.videos]
         self.rrd_entity_paths = [feature.rrd_entity_path for feature in all_features]
-        self.features = {
-            f"{feature.rrd_entity_path}:{feature.rrd_component}": feature
-            for feature in all_features
-        }
+        self.features = {f"{feature.rrd_entity_path}:{feature.rrd_component}": feature for feature in all_features}
         self.column_mapping = {
-            f"{feature.rrd_entity_path}:{feature.rrd_component}": feature.name
-            for feature in all_features
+            f"{feature.rrd_entity_path}:{feature.rrd_component}": feature.name for feature in all_features
         }
         self.column_mapping["ts"] = "ts"
         self.decoders = {
@@ -152,8 +157,11 @@ class RerunReplayer:
             sample = next(stream_iter)
             dataframe = sample.to_pyarrow().to_pandas()
             for row in dataframe.to_dict(orient="records"):
-                data = self._decode_frames({key: value for key, value in row.items() if not _is_null(value)})
-                most_recent_sample.update(data)
+                try:
+                    data = self._decode_frames({key: value for key, value in row.items() if not _is_null(value)})
+                    most_recent_sample.update(data)
+                except AssertionError as e:
+                    print(f"failed one sample: {e}")
 
         LOGGER.info("All streams populated at %s", most_recent_sample["ts"])
         next_publish_ts = most_recent_sample["ts"] + pd.Timedelta(seconds=1 / self.publish_hz)
@@ -162,7 +170,11 @@ class RerunReplayer:
         for sample in stream:
             dataframe = sample.to_pyarrow().to_pandas()
             for row in dataframe.to_dict(orient="records"):
-                data = self._decode_frames({key: value for key, value in row.items() if not _is_null(value)})
+                try:
+                    data = self._decode_frames({key: value for key, value in row.items() if not _is_null(value)})
+                except:
+                    print(f"Failed to decode a frame. skipping.")
+                    continue
                 while data["ts"] > next_sample_ts:
                     last_samples.append(most_recent_sample.copy())
                     next_sample_ts = next_sample_ts + pd.Timedelta(seconds=1 / self.hz)
@@ -173,13 +185,39 @@ class RerunReplayer:
                 most_recent_sample.update(data)
 
 
+def _action_prefix_payload(
+    processed_sample: dict[str, np.ndarray],
+    action_prefix_steps: int,
+    prefix_change_start: int,
+) -> dict[str, object]:
+    assert action_prefix_steps >= 0, f"action_prefix_steps must be non-negative, got {action_prefix_steps}"
+    if action_prefix_steps == 0:
+        return {}
+
+    actions = processed_sample["action"]
+    assert actions.ndim == 2, f"Expected action prefix source to be 2-D, got {actions.shape}"
+    assert action_prefix_steps <= actions.shape[0], (
+        f"action_prefix_steps must be <= action horizon {actions.shape[0]}, got {action_prefix_steps}"
+    )
+    action_prefix = actions[:action_prefix_steps].astype(np.float32, copy=False)
+    return {
+        ACTION_PREFIX_KEY: action_prefix,
+        PREFIX_CHANGE_START_KEY: prefix_change_start,
+    }
+
+
 async def predict_sample(
     feature_bundle: FeatureBundle,
     sample: dict[str, np.ndarray | pd.Timestamp],
     predict_url: str,
     policy_id: str,
-    prompt: str,
+    task: str,
+    subtask: str,
+    action_prefix_steps: int = 0,
+    prefix_change_start: int = 0,
 ) -> RemotePolicyPrediction:
+    assert task, "task cannot be empty"
+    assert subtask, "subtask cannot be empty"
     arrays: dict[str, np.ndarray] = {}
     for key, value in sample.items():
         if key == "ts":
@@ -191,11 +229,13 @@ async def predict_sample(
         return await inference_client.predict(
             {
                 JOINT_STATE_KEY: processed_sample["observation.state"],
-                PROMPT_KEY: prompt,
+                TASK_KEY: task,
+                SUBTASK_KEY: subtask,
                 MODEL_ID_KEY: policy_id,
                 "observation/images/main_image": processed_sample["head"],
                 "observation/images/left_wrist_image": processed_sample["left_wrist"],
                 "observation/images/right_wrist_image": processed_sample["right_wrist"],
+                **_action_prefix_payload(processed_sample, action_prefix_steps, prefix_change_start),
             }
         )
 
@@ -308,7 +348,9 @@ def log_to_rerun(
     hz: int,
 ) -> None:
     assert samples, "Expected at least one sample to log"
-    assert len(samples) == len(predictions), f"Expected one prediction per sample, got {len(samples)} != {len(predictions)}"
+    assert len(samples) == len(predictions), (
+        f"Expected one prediction per sample, got {len(samples)} != {len(predictions)}"
+    )
 
     rr.init(RERUN_APP_ID)
     rr.save(str(output_path))
@@ -355,10 +397,13 @@ async def replay_recording(
     output_path: Path = DEFAULT_OUTPUT_PATH,
     predict_url: str = DEFAULT_PREDICT_URL,
     policy_id: str = DEFAULT_POLICY_ID,
-    prompt: str = DEFAULT_PROMPT,
+    task: str = DEFAULT_TASK,
+    subtask: str = DEFAULT_SUBTASK,
     hz: int = 50,
     prediction_hz: float = 1.0,
     max_samples: int = 250,
+    action_prefix_steps: int = 0,
+    prefix_change_start: int = 0,
 ) -> ReplaySummary:
     assert max_samples > 0, f"max_samples must be positive, got {max_samples}"
     recording_path = recording_path.expanduser()
@@ -378,7 +423,18 @@ async def replay_recording(
             break
         samples.append(sample)
         prediction_tasks.append(
-            asyncio.create_task(predict_sample(feature_bundle, sample, predict_url, policy_id, prompt))
+            asyncio.create_task(
+                predict_sample(
+                    feature_bundle,
+                    sample,
+                    predict_url,
+                    policy_id,
+                    task,
+                    subtask,
+                    action_prefix_steps=action_prefix_steps,
+                    prefix_change_start=prefix_change_start,
+                )
+            )
         )
         await asyncio.sleep(0)
 
@@ -426,11 +482,24 @@ def main(
         help="Inference server WebSocket URL.",
     ),
     policy_id: str = typer.Option(DEFAULT_POLICY_ID, help="Model id sent in each request."),
-    prompt: str = typer.Option(DEFAULT_PROMPT, help="Unified prompt in format task;subtask."),
+    task: str = typer.Option(DEFAULT_TASK, help="Task sent in each request."),
+    subtask: str = typer.Option(DEFAULT_SUBTASK, help="Subtask sent in each request."),
     hz: int = typer.Option(50, min=1, help="Input sample rate."),
     prediction_hz: float = typer.Option(1.0, min=0.001, help="Prediction rate."),
     max_samples: int = typer.Option(250, min=1, help="Maximum replay windows."),
+    action_prefix_steps: int = typer.Option(0, min=0, help="Ground-truth action prefix rows sent per request."),
+    prefix_change_start: int | None = typer.Option(
+        None,
+        help="prefix_change_start sent with action_prefix. Defaults to --action-prefix-steps.",
+        show_default=False,
+    ),
 ) -> None:
+    if prefix_change_start is None:
+        prefix_change_start = action_prefix_steps
+    assert prefix_change_start >= 0, f"prefix_change_start must be non-negative, got {prefix_change_start}"
+    assert prefix_change_start <= action_prefix_steps, (
+        f"prefix_change_start must be <= action_prefix_steps, got {prefix_change_start} > {action_prefix_steps}"
+    )
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     summary = asyncio.run(
         replay_recording(
@@ -439,10 +508,13 @@ def main(
             output_path=output_path,
             predict_url=predict_url,
             policy_id=policy_id,
-            prompt=prompt,
+            task=task,
+            subtask=subtask,
             hz=hz,
             prediction_hz=prediction_hz,
             max_samples=max_samples,
+            action_prefix_steps=action_prefix_steps,
+            prefix_change_start=prefix_change_start,
         )
     )
     typer.echo(

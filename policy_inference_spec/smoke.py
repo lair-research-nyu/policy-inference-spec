@@ -8,12 +8,12 @@ import sys
 from contextlib import asynccontextmanager
 
 import numpy as np
-import simplejpeg  # type: ignore[import-untyped]
+import simplejpeg
 
 from policy_inference_spec.client import RemotePolicyClient
 from policy_inference_spec.hardware_model import DEFAULT_HARDWARE_MODEL
-from policy_inference_spec.protocol import JOINT_STATE_KEY, MODEL_ID_KEY, PROMPT_KEY
-from server.server import run_example_server
+from policy_inference_spec.protocol import JOINT_STATE_KEY, MODEL_ID_KEY, SUBTASK_KEY, TASK_KEY
+from server.minimal import run_example_server
 
 
 def _random_predict_frame() -> dict[str, object]:
@@ -21,7 +21,8 @@ def _random_predict_frame() -> dict[str, object]:
     height, width = DEFAULT_HARDWARE_MODEL.image_resolution
     frame: dict[str, object] = {
         JOINT_STATE_KEY: rng.standard_normal(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
-        PROMPT_KEY: "",
+        TASK_KEY: "",
+        SUBTASK_KEY: "",
         MODEL_ID_KEY: "",
     }
     for cam in DEFAULT_HARDWARE_MODEL.cameras:
