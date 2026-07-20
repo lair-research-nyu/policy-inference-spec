@@ -531,8 +531,8 @@ def _inference_response(
     )
     state_25_str = np.array2string(state_25, precision=3, suppress_small=True, max_line_width=400)
     LOGGER.info(
-        "predict req=%d raw_state_hash=%s state_25=%s images=[%s]",
-        req_id, raw_state_hash, state_25_str, image_fingerprints,
+        "predict req=%d task=%r raw_state_hash=%s state_25=%s images=[%s]",
+        req_id, prompt, raw_state_hash, state_25_str, image_fingerprints,
     )
 
     obs: dict[str, Any] = {
