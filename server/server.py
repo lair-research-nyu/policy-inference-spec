@@ -2,10 +2,16 @@
 #   python -m server.server --checkpoint-path models/<ckpt> --host 0.0.0.0 --port 18090
 #
 # Consolidated policy inference server (merges old_minimal.py, old_minimal_debug.py,
-# rtc_server.py). Two inference paths:
+# rtc_server.py). Three inference paths:
 #   * default: synchronous select_action loop (works for act / pi0 / pi0_fast / pi05)
 #   * --rtc:   Real-Time Chunking via predict_action_chunk with prefix-guided
 #              inpainting (pi0 / pi05 flow-matching policies only)
+#   * --rl-agent-url: latent-space RL. An external agent picks the flow-matching
+#              starting noise from the policy's own prefix embedding and learns from the
+#              transitions; the robot client is unchanged and never sees a latent.
+#              Mutually exclusive with --rtc and --temporal-ensemble-coeff, both of
+#              which rewrite the chunk after denoising. See server/pi0_latent.py and
+#              policy_inference_spec/rl.py.
 #
 # Wire contract for the RTC prefix (per inference request frame):
 #   * ``prefix_change_start`` (int, optional): number of steps at the start of the
@@ -45,6 +51,8 @@ from policy_inference_spec.protocol import (
     ACTION_KEY,
     ACTION_PREFIX_KEY,
     DEFAULT_INFERENCE_SERVER_PORT,
+    DONE_KEY,
+    DONE_REASON_KEY,
     ENDPOINT_DONE,
     ENDPOINT_KEY,
     ENDPOINT_TELEMETRY,
@@ -53,12 +61,23 @@ from policy_inference_spec.protocol import (
     MODEL_ID_KEY,
     POLICY_ID_KEY,
     PREFIX_CHANGE_START_KEY,
+    PREV_SKIPPED_ACTION_START_KEY,
     Q_VALUE_KEY,
+    REWARD_KEY,
+    RL_ENABLED_KEY,
     STATUS_KEY,
     SUBTASK_KEY,
     TASK_KEY,
     ServerFeature,
     ServerHandshake,
+)
+from policy_inference_spec.rl import (
+    DEFAULT_AGENT_PORT,
+    AgentObservation,
+    NullAgent,
+    RemoteAgent,
+    RLAgent,
+    Transition,
 )
 
 import hashlib
@@ -141,6 +160,11 @@ DEFAULT_EXECUTION_HORIZON = 10
 DEFAULT_RTC_SCHEDULE = "EXP"
 DEFAULT_MAX_GUIDANCE_WEIGHT = 10.0
 
+# Edge length of the square images handed to the RL agent. Small on purpose: the agent's
+# own conv encoder is tiny compared to the policy's, and the scene detail it cannot
+# resolve at this size is already available to it through the policy's prefix embedding.
+DEFAULT_RL_RESIZE_IMAGE = 128
+
 # Populated by _init_policy() once the checkpoint path / policy type are known.
 POLICY: Any = None
 POLICY_TYPE: str | None = None
@@ -152,6 +176,12 @@ _POSTPROCESSOR: Any = None
 # request so it can stay in sync with the client's chunk execution limit.
 RTC_ENABLED: bool = False
 EXECUTION_HORIZON: int = DEFAULT_EXECUTION_HORIZON
+# Latent-space RL runtime, populated by _init_rl(). RL_AGENT defaults to None (plain
+# inference); with an agent attached the server asks it for the denoiser's starting
+# latent instead of sampling one, and reports transitions back for learning.
+RL_BACKEND: Any = None
+RL_AGENT: RLAgent | None = None
+RL_RESIZE_IMAGE: int = DEFAULT_RL_RESIZE_IMAGE
 
 
 class TemporalEnsembleBuffer:
@@ -212,6 +242,24 @@ class _RtcState:
 
     def reset(self) -> None:
         self.last_chunk = None
+
+
+class _RlState:
+    """Per-connection RL bookkeeping.
+
+    Only the previous step's id is kept: the agent caches the observations it was sent,
+    so a transition is just a pair of ids plus what happened in between. A new episode
+    must start with no predecessor, or the first transition of the new episode would be
+    stitched onto the last one of the old.
+    """
+
+    __slots__ = ("last_step_id",)
+
+    def __init__(self) -> None:
+        self.last_step_id: int | None = None
+
+    def reset(self) -> None:
+        self.last_step_id = None
 
 
 def _load_config_tolerant(checkpoint_path: Path, config_cls: Any):
@@ -374,6 +422,51 @@ def _init_policy(
     print("Init complete.", flush=True)
 
 
+async def _init_rl(agent_url: str | None, *, resize_image: int = DEFAULT_RL_RESIZE_IMAGE) -> None:
+    """Attach a latent-space RL agent. Call after _init_policy().
+
+    With ``agent_url=None`` the server keeps behaving exactly as it does without RL: the
+    policy samples its own noise and no RL code runs on the request path.
+    """
+    global RL_BACKEND, RL_AGENT, RL_RESIZE_IMAGE
+    if agent_url is None:
+        RL_BACKEND, RL_AGENT = None, None
+        return
+
+    from server.pi0_latent import FlowLatentBackend
+
+    assert POLICY is not None, "_init_rl() must be called after _init_policy()"
+    assert resize_image > 0, f"resize_image must be positive, got {resize_image}"
+    RL_RESIZE_IMAGE = resize_image
+    RL_BACKEND = FlowLatentBackend(POLICY, str(POLICY_TYPE))
+
+    agent = RemoteAgent(agent_url)
+    handshake = await agent.connect()
+    assert handshake.latent_shape == RL_BACKEND.latent_shape, (
+        f"agent produces latents of shape {handshake.latent_shape} but {POLICY_TYPE} denoises "
+        f"{RL_BACKEND.latent_shape}; the agent's action space must match the policy's noise space"
+    )
+    RL_AGENT = agent
+    LOGGER.info(
+        "Latent RL enabled: agent=%s latent_shape=%s resize_image=%d",
+        agent.url, RL_BACKEND.latent_shape, RL_RESIZE_IMAGE,
+    )
+
+
+def _agent_images(frame: dict[str, Any], size: int) -> dict[str, np.ndarray]:
+    """Decode the wire frame's JPEGs into small uint8 HWC images for the agent."""
+    images: dict[str, np.ndarray] = {}
+    for wire_key in _CAMERA_KEY_MAP:
+        decoded = simplejpeg.decode_jpeg(frame[wire_key], colorspace="RGB")  # uint8 HWC
+        tensor = torch.from_numpy(decoded).permute(2, 0, 1).unsqueeze(0).float()
+        resized = torch.nn.functional.interpolate(
+            tensor, size=(size, size), mode="bilinear", align_corners=False
+        )
+        name = wire_key.rsplit("/", 1)[-1]
+        images[name] = resized.squeeze(0).permute(1, 2, 0).round().clamp(0, 255).to(torch.uint8).numpy()
+    return images
+
+
 def server_handshake_config(
     *, server_features: Iterable[str | ServerFeature] = (),
 ) -> ServerHandshake:
@@ -504,9 +597,75 @@ def _predict_chunk_sync(
     return action, inference_time_s
 
 
-def _inference_response(
+async def _predict_chunk_rl(
+    obs_processed: dict[str, Any],
+    frame: dict[str, Any],
+    rl_state: _RlState,
+    *,
+    state: np.ndarray,
+    prompt: str,
+    action_horizon: int,
+    req_id: int,
+) -> tuple[np.ndarray, float, float | None]:
+    """RL path: condition once, let the agent choose the starting latent, then denoise.
+
+    The agent is consulted *between* the two halves of inference because the latent it
+    must choose depends on the policy's own view of the scene (the prefix embedding),
+    which only exists after the conditioning pass.
+    """
+    assert RL_BACKEND is not None and RL_AGENT is not None, "RL path reached without an agent"
+    t0 = time.perf_counter()
+
+    prefix_rep, cache = RL_BACKEND.prefix(obs_processed)
+    observation = AgentObservation(
+        images=_agent_images(frame, RL_RESIZE_IMAGE),
+        state=state.astype("float32"),
+        prefix_rep=prefix_rep[0],
+        task=prompt,
+    )
+
+    # Report the *previous* step's outcome before asking for a new latent, so the agent
+    # decides with the freshest possible information. Reward and done ride in on this
+    # request's frame because they describe what the last chunk accomplished.
+    if rl_state.last_step_id is not None:
+        # How many actions of the previous chunk actually ran. The client reports this
+        # when it truncates a chunk; without it we can only assume the whole thing ran.
+        executed_raw = frame.get(PREV_SKIPPED_ACTION_START_KEY)
+        executed_steps = int(executed_raw) if executed_raw else action_horizon
+        reward_raw = frame.get(REWARD_KEY)
+        await RL_AGENT.observe(
+            Transition(
+                step_id=req_id,
+                prev_step_id=rl_state.last_step_id,
+                executed_steps=max(1, executed_steps),
+                reward=None if reward_raw is None else float(reward_raw),
+                done=bool(frame.get(DONE_KEY, False)),
+            )
+        )
+
+    agent_action = await RL_AGENT.act(req_id, observation)
+    raw_chunk = RL_BACKEND.denoise(cache, agent_action.latent[np.newaxis, ...])  # (1, T, A)
+    rl_state.last_step_id = req_id
+
+    # Postprocess (unnormalize) into robot action space; (T, 1, A) matches the per-step
+    # stacking the other two paths use.
+    chunk_tensor = torch.from_numpy(raw_chunk[0]).unsqueeze(1).to(str(POLICY.config.device))
+    action_full = _POSTPROCESSOR(chunk_tensor).squeeze(1).cpu().numpy().astype("float32")
+    inference_time_s = time.perf_counter() - t0
+
+    action = action_full[:action_horizon]
+    LOGGER.info(
+        "predict req=%d rl=on latent_std=%.3f q=%s chunk=%d returned=%d inference_s=%.3f",
+        req_id, float(agent_action.latent.std()), agent_action.q_value,
+        raw_chunk.shape[1], action.shape[0], inference_time_s,
+    )
+    return action, inference_time_s, agent_action.q_value
+
+
+async def _inference_response(
     frame: dict[str, Any],
     rtc_state: _RtcState,
+    rl_state: _RlState,
     *,
     action_horizon: int = DEFAULT_ACTION_HORIZON,
     prompt: str = "",
@@ -546,7 +705,13 @@ def _inference_response(
 
     obs_processed = _PREPROCESSOR(obs)
 
-    if RTC_ENABLED:
+    q_value: float | None = None
+    if RL_AGENT is not None:
+        action, inference_time_s, q_value = await _predict_chunk_rl(
+            obs_processed, frame, rl_state,
+            state=state_25, prompt=prompt, action_horizon=action_horizon, req_id=req_id,
+        )
+    elif RTC_ENABLED:
         action, inference_time_s = _predict_chunk_rtc(
             obs_processed, frame, rtc_state,
             device=device, action_horizon=action_horizon, req_id=req_id,
@@ -572,7 +737,8 @@ def _inference_response(
         ACTION_KEY: action,
         INFERENCE_TIME_KEY: inference_time_s,
         POLICY_ID_KEY: POLICY_ID,
-        Q_VALUE_KEY: 0.0,
+        RL_ENABLED_KEY: RL_AGENT is not None,
+        Q_VALUE_KEY: 0.0 if q_value is None else float(q_value),
     }
     validate_wire_inference_response(resp)
     return resp
@@ -596,6 +762,7 @@ async def handle_inference_connection(
     # sends ENDPOINT_DONE at the end of the prior one), and must not inherit
     # the previous chunk.
     rtc_state = _RtcState()
+    rl_state = _RlState()
     ensemble_buffer = (
         TemporalEnsembleBuffer(action_horizon, DEFAULT_HARDWARE_MODEL.action_dim, temporal_ensemble_coeff)
         if temporal_ensemble_coeff is not None
@@ -617,6 +784,14 @@ async def handle_inference_connection(
             rtc_state.reset()
             if ensemble_buffer is not None:
                 ensemble_buffer.reset()
+            if RL_AGENT is not None:
+                # The agent labels and learns from the finished episode here. This can
+                # block for a long time (operator input, gradient steps) and that is the
+                # intended back-pressure: the robot cannot start the next episode until
+                # the learner has caught up.
+                reason = frame.get(DONE_REASON_KEY, "")
+                await RL_AGENT.episode_end(str(reason) if reason else "")
+                rl_state.reset()
             await connection.send(serialize_to_msgpack({"status": "ok"}))
             continue
         if frame.get(ENDPOINT_KEY) == ENDPOINT_TELEMETRY:
@@ -631,9 +806,10 @@ async def handle_inference_connection(
         _ = frame[MODEL_ID_KEY]
         _ = frame[SUBTASK_KEY]
         prompt = task if task is not None else frame[TASK_KEY]
-        resp = _inference_response(
+        resp = await _inference_response(
             frame,
             rtc_state,
+            rl_state,
             action_horizon=action_horizon,
             prompt=prompt,
             ensemble_buffer=ensemble_buffer,
@@ -746,6 +922,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_MAX_GUIDANCE_WEIGHT,
         help=f"RTC max guidance weight (default: {DEFAULT_MAX_GUIDANCE_WEIGHT}).",
     )
+    parser.add_argument(
+        "--rl-agent-url",
+        default=None,
+        metavar="URL",
+        help="Enable latent-space RL by delegating the denoiser's starting noise to an RL "
+             f"agent at this WebSocket URL (e.g. ws://127.0.0.1:{DEFAULT_AGENT_PORT}). The agent "
+             "also receives the resulting transitions. pi0/pi05 only. Off by default: without "
+             "it the policy samples its own noise exactly as before.",
+    )
+    parser.add_argument(
+        "--rl-resize-image",
+        type=int,
+        default=DEFAULT_RL_RESIZE_IMAGE,
+        help=f"Edge length of the square camera images sent to the RL agent "
+             f"(default: {DEFAULT_RL_RESIZE_IMAGE}).",
+    )
     return parser.parse_args(argv)
 
 
@@ -763,6 +955,22 @@ async def _run_cli(argv: Sequence[str] | None = None) -> int:
         "--rtc and --temporal-ensemble-coeff are mutually exclusive: both are chunk-consistency "
         "mechanisms and ensembling RTC-guided chunks would fight the prefix guidance"
     )
+    if args.rl_agent_url is not None:
+        # Both of these rewrite the chunk after denoising, so the executed actions would
+        # no longer be the ones the agent's latent produced and the critic would be
+        # learning against a mapping that does not exist at execution time.
+        assert not args.rtc, (
+            "--rl-agent-url and --rtc are mutually exclusive: RTC inpaints the previous chunk "
+            "into the denoise loop, breaking the latent -> action mapping the RL critic learns"
+        )
+        assert args.temporal_ensemble_coeff is None, (
+            "--rl-agent-url and --temporal-ensemble-coeff are mutually exclusive: ensembling "
+            "blends chunks from different latents, so no single latent explains the executed actions"
+        )
+        assert args.policy_type in ("pi0", "pi05"), (
+            f"--rl-agent-url requires a flow-matching policy whose sampler starts from noise; "
+            f"got --policy-type {args.policy_type}"
+        )
     server_features = _cli_server_features(args.no_rewards)
     logging.basicConfig(
         level=logging.INFO,
@@ -778,6 +986,7 @@ async def _run_cli(argv: Sequence[str] | None = None) -> int:
         rtc_schedule=args.rtc_schedule,
         max_guidance_weight=args.max_guidance_weight,
     )
+    await _init_rl(args.rl_agent_url, resize_image=args.rl_resize_image)
     async with run_example_server(
         host=args.host,
         port=args.port,
@@ -792,6 +1001,8 @@ async def _run_cli(argv: Sequence[str] | None = None) -> int:
         else:
             print("Task prompt: from each request (robot's configured task)", flush=True)
         mode_suffix = f" rtc={'on' if RTC_ENABLED else 'off'}"
+        if RL_AGENT is not None:
+            mode_suffix += f" rl={args.rl_agent_url}"
         if args.one_shot:
             mode_suffix += " one_shot=True"
         if args.temporal_ensemble_coeff is not None:
