@@ -387,18 +387,37 @@ class RemotePolicyClient:
         assert "error" not in result, f"unexpected error payload: {_summarize_server_payload(result)}"
         return result
 
-    async def mark_episode_done(self, done_reason: str) -> None:
+    async def mark_episode_done(
+        self,
+        done_reason: str,
+        *,
+        final_wire_frame: dict[str, Any] | None = None,
+        executed_steps: int | None = None,
+    ) -> None:
         done_reason = _validate_done_reason(done=True, done_reason=done_reason)
-        # Flag the most recent inference event on the server as terminal without sending a new
-        # observation. Only meaningful over the existing connection: a reconnect would yield a new
-        # client_id with no recorded events, so skip when the socket is already closed.
+        supplied = (final_wire_frame is not None, executed_steps is not None)
+        assert all(supplied) or not any(supplied), "final_wire_frame and executed_steps must be supplied together"
+        if final_wire_frame is not None:
+            assert executed_steps is not None and executed_steps >= 1, (
+                f"executed_steps must be positive, got {executed_steps}"
+            )
+            payload = self._encode_wire_frame_images(final_wire_frame)
+            validate_wire_inference_request_frame(payload)
+            self._warn_on_camera_name_mismatch(payload)
+            payload[PREV_SKIPPED_ACTION_START_KEY] = int(executed_steps)
+        else:
+            payload = {}
+        payload.update({ENDPOINT_KEY: ENDPOINT_DONE, DONE_REASON_KEY: done_reason})
+
+        # Only meaningful over the existing connection: reconnecting would create a
+        # new server-side episode with no most-recent latent to close.
         if self._ws is None:
             return
         try:
             async with self._lock:
                 if self._ws is None:
                     return
-                await self._ws.send(serialize_to_msgpack({ENDPOINT_KEY: ENDPOINT_DONE, DONE_REASON_KEY: done_reason}))
+                await self._ws.send(serialize_to_msgpack(payload))
                 await self._ws.recv()
         except websockets.ConnectionClosedError as exc:
             LOGGER.warning("Failed to mark episode done; connection closed: %s", exc)

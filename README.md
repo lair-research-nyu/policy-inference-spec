@@ -29,6 +29,9 @@ The base install now includes the dependencies needed by both module CLIs:
 
 ## Entrypoints
 
+For indexed YOR LeRobot dataset replay with local OpenPI or LeRobot inference,
+see [Replay a LeRobot episode](docs/replay_lerobot.md).
+
 ### Python module CLIs
 
 `policy_inference_spec.smoke`
@@ -145,6 +148,63 @@ uv run python -m server.minimal --no-rewards
 ```
 
 The CLI defaults to `--action-horizon 50` so it works with `policy_inference_spec.replay_rrd` out of the box. The importable `run_example_server()` helper still defaults to a shorter horizon of `4` unless you override `action_horizon=...`.
+
+### openpi server
+
+`server.server_openpi` serves checkpoints trained with openpi (JAX) through
+[lair-train-pipeline](https://github.com/lair-research-nyu/lair-train-pipeline) and the
+[lair-openpi](https://github.com/lair-research-nyu/lair-openpi) fork. It speaks the same
+wire protocol as `server.server`, so the robot client does not change. openpi needs
+numpy<2 and Python 3.11, and lerobot needs numpy 2, so this server runs in the
+lair-openpi venv with this repo on `PYTHONPATH`:
+
+```bash
+git clone https://github.com/lair-research-nyu/lair-openpi ~/projects/lair-openpi
+cd ~/projects/lair-openpi && GIT_LFS_SKIP_SMUDGE=1 uv sync
+uv pip install --python .venv/bin/python msgspec simplejpeg
+
+cd ~/projects/policy-inference-spec
+PYTHONPATH=. ~/projects/lair-openpi/.venv/bin/python -m server.server_openpi \
+  --checkpoint-path models/openpi-ultra-cubestack-pi0-rtctrain-10000 --rtc-train \
+  --host 0.0.0.0 --port 18090
+```
+
+- The checkpoint is an openpi step directory (`params/`, `assets/<id>/norm_stats.json`).
+  The server reads pi0 vs pi0.5 and the action dim from the weights. It uses
+  lair-train-pipeline's camera mapping: head → `base_0_rgb`, left/right wrist → wrist slots.
+- `--model-action-horizon` (default 50) and `--rtc-train-min/max-delay` (default
+  [0, 15)) must match the training config, because the checkpoint does not store them.
+- `--rtc-train`, `--resume-gap-s`, `--task`, `--prompt-source` and the action limiter
+  flags work as they do in `server.server`. It does not implement inference-time RTC
+  (`--rtc`), latent RL, temporal ensembling or state pins.
+- Tests: `PYTHONPATH=. ~/projects/lair-openpi/.venv/bin/python -m pytest tests/test_server_openpi.py`
+  also runs the test that loads the real checkpoint.
+
+### DynamicVLA server
+
+`server.server_dynamicvla` serves [DynamicVLA](https://github.com/hzxie/DynamicVLA)
+checkpoints (`config.json` with `"type": "dynamicvla"` plus one `model.epochNNNN.safetensors`)
+over the same wire protocol. DynamicVLA is written for lerobot 0.3.3 on Python 3.10,
+so it runs in its own venv, `.venv-dynamicvla`, and imports the model code from a local
+DynamicVLA checkout (`--dynamicvla-root`, default `~/embodied_at_sea_ws/src/DynamicVLA`):
+
+```bash
+uv venv --python 3.10 --python-preference only-managed .venv-dynamicvla
+VIRTUAL_ENV=.venv-dynamicvla uv pip install -r requirements-dynamicvla.txt --index-strategy unsafe-best-match
+
+PYTHONPATH=. .venv-dynamicvla/bin/python -m server.server_dynamicvla \
+  --checkpoint-path models/cubestack-dynamicvla --task "stack cubes" --host 0.0.0.0 --port 18090
+```
+
+- The model reads the current frame plus older ones, set by `delta_timestamps.observation`
+  in dataset frames. For cubestack that is `[-5, 0]`, i.e. 0.1 s ago at 50 Hz
+  (`--dataset-fps`). The server keeps the frames it receives (inference requests, and
+  telemetry frames with every camera) and uses the one closest to each offset. If none is
+  within `--history-tolerance-s`, it repeats the current frame and logs `history=[MISSING now]`.
+- Actions are trained relative to the current state, except the dims whose
+  normalization stats show they were absolute. For cubestack those are the two grippers.
+  Override the inferred dims with `--absolute-action-dims`.
+- There is no RTC. `--task`, `--prompt-source` and the action limiter flags work as they do in `server.server`.
 
 ### Debug inference server
 
@@ -279,6 +339,24 @@ Current validation rules:
 - `endpoint` must not be present on inference frames.
 - `task` must be `str`.
 - `subtask` must be `str`.
+- `task` and `subtask` are either both non-empty or both empty. `task` is the robot's
+  top-level selection and `subtask` the step being executed under it — but when the run
+  is driven by a construction assembled in the web UI, both hold the *construction's*
+  name (`simple_list`, `generic_subtask`) rather than anything a policy was trained on,
+  and the instruction itself rides in `conditioning_metadata` / `start_metadata`.
+
+  `server.server --prompt-source` (default `auto`) decides what the policy is
+  conditioned on: `auto` takes the first conventionally-named field
+  (`instruction`, `language_instruction`, `prompt`, `message`, `text`, `description`)
+  found in those two metadata dicts — the Ultra web UI sends
+  `start_metadata={'message': 'stack cubes'}` — else the subtask, else the task; `subtask` / `task` take
+  that wire field verbatim; anything else is a dotted path into the frame, e.g.
+  `conditioning_metadata.instruction`. `--task` bypasses the frame entirely. The server
+  logs the resolved prompt with its origin, and logs each request's non-observation
+  metadata whenever it changes, so the right path can be read off the log. An
+  instruction found in metadata is held for the rest of the episode:
+  `start_metadata` need not repeat on every request, and falling back to the wire
+  fields when it is absent would swap the policy's conditioning mid-episode.
 - `model_id` must be `str`.
 - `observation/state` must be a 1-D `numpy.ndarray` with shape `(97,)`.
 - Each image field must be either JPEG `bytes` or a `numpy.ndarray`.
@@ -289,6 +367,19 @@ Optional request fields:
 - `observation/images/table_view_image`: optional station hardware camera. JPEG `bytes` or `numpy.ndarray`. May be omitted when the station has no table-view cam.
 - `action_prefix`: floating 2-D `numpy.ndarray` shaped `(prefix_steps, 25)`. It carries only real prefix actions; clients must not pad it to the full policy horizon.
 - `prefix_change_start`: non-negative `int`. Required when `action_prefix` is present. In replay tooling this defaults to `--action-prefix-steps` unless `--prefix-change-start` is set.
+
+  Pausing an async rollout (teleop / DAgger interventions) breaks the prefix's meaning: it
+  is a promise that those rows are executing right now, and after a pause they never ran
+  and a human has moved the arms. The first request after a resume must therefore carry
+  **neither** field — that yields an unconditioned chunk planned from the live observation,
+  and the client executes it from step 0 rather than skipping `prefix_change_start` steps.
+  Chaining resumes on the request after it.
+
+  `server.server` enforces this without the client's cooperation: it ignores the prefix on
+  any request that opens a connection, follows an `endpoint=intervention` frame, or arrives
+  more than `--resume-gap-s` (default 1 s) after the previous one. It cannot do anything
+  about a client that replays the action queue it kept across the pause — those actions
+  never reach the server.
 - `reward`, `done`, `done_reason`, `prev_skipped_action_start`
 - `start_metadata`, `conditioning_metadata`
 - `observation/hidden`, `observation/env`
@@ -311,6 +402,9 @@ Optional request fields:
 
 Optional response fields:
 
+- `chunk_id`: echo the request's `chunk_id` when provided. This lets the client discard
+  replies left over from cancelled predictions after pause/resume; omitting it can make
+  an old reply appear to belong to the new request.
 - `inference_time`: numeric
 - `policy_id`: `str`
 - `rl_enabled`: `bool`, whether the returned action chunk used the RL actor

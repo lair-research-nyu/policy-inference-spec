@@ -19,6 +19,7 @@ from policy_inference_spec.hardware_model import (
     validate_wire_inference_response,
 )
 from policy_inference_spec.protocol import (
+    CHUNK_ID_KEY,
     ACTION_KEY,
     DEFAULT_INFERENCE_SERVER_PORT,
     ENDPOINT_DONE,
@@ -101,6 +102,8 @@ def _inference_response(
         POLICY_ID_KEY: EXAMPLE_POLICY_ID,
         Q_VALUE_KEY: 0.0,
     }
+    if CHUNK_ID_KEY in frame:
+        resp[CHUNK_ID_KEY] = frame[CHUNK_ID_KEY]
     validate_wire_inference_response(resp)
     return resp
 

@@ -250,6 +250,31 @@ async def test_mark_episode_done_sends_done_reason() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mark_episode_done_can_include_terminal_observation() -> None:
+    client = RemotePolicyClient("ws://127.0.0.1:9/ws")
+    ws_mock = MagicMock()
+    ws_mock.send = AsyncMock()
+    ws_mock.recv = AsyncMock(return_value=serialize_to_msgpack({"status": "ok"}))
+    client._ws = ws_mock
+    frame = _valid_wire_frame()
+
+    await client.mark_episode_done(
+        "robot_paused", final_wire_frame=frame, executed_steps=7
+    )
+
+    await_args = ws_mock.send.await_args
+    assert await_args is not None
+    sent_payload = deserialize_from_msgpack(await_args.args[0])
+    assert sent_payload[ENDPOINT_KEY] == ENDPOINT_DONE
+    assert sent_payload[DONE_REASON_KEY] == "robot_paused"
+    assert sent_payload[PREV_SKIPPED_ACTION_START_KEY] == 7
+    np.testing.assert_array_equal(sent_payload[JOINT_STATE_KEY], frame[JOINT_STATE_KEY])
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        key = f"observation/{camera}"
+        assert sent_payload[key] == frame[key]
+
+
+@pytest.mark.asyncio
 async def test_predict_includes_prev_skipped_action_start() -> None:
     cfg = serialize_to_msgpack(_server_handshake_payload())
     resp = serialize_to_msgpack(

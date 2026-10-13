@@ -47,10 +47,12 @@ METHOD_KEY = "method"
 METHOD_ACT = "act"
 METHOD_OBSERVE = "observe"
 METHOD_EPISODE_END = "episode_end"
+METHOD_ACTIONS = "actions_taken"
 
 # Agent handshake keys.
 LATENT_SHAPE_KEY = "latent_shape"
 AGENT_ID_KEY = "agent_id"
+WANTS_ACTIONS_KEY = "wants_actions"
 
 # Message payload keys.
 STEP_ID_KEY = "step_id"
@@ -66,6 +68,9 @@ EXECUTED_STEPS_KEY = "executed_steps"
 REWARD_KEY = "reward"
 DONE_KEY = "done"
 REASON_KEY = "reason"
+ACTIONS_KEY = "actions"
+RAW_ACTIONS_KEY = "raw_actions"
+ACTION_HORIZON_KEY = "action_horizon"
 
 
 @dataclass(frozen=True)
@@ -141,6 +146,66 @@ class AgentAction:
 
 
 @dataclass(frozen=True)
+class ProducedActions:
+    """The action chunk the policy actually produced from the agent's latent.
+
+    The RL loop does not need this: the agent chose the latent, and the transition that
+    follows tells it what the robot did with the resulting chunk. It exists so a run can
+    be *reconstructed* offline. The latent -> action map is the one link in the chain
+    that lives entirely inside the server — a recorded episode without it can say which
+    noise the actor picked but never what motion that noise turned into, which is exactly
+    the question a steerability post-mortem asks.
+
+    ``actions`` is the full denoised chunk in robot action space, before truncation to the
+    client's ``action_horizon``. ``raw_actions`` is the same chunk one step earlier: as the
+    denoiser emitted it, still normalized. It is already trimmed to the robot's action dim
+    rather than padded to the policy's -- ``LatentPolicyBackend.denoise`` drops the padding
+    columns -- so the two differ in scale alone. Both are kept because the normalizer lives
+    in a checkpoint directory a later analysis may no longer have, and re-deriving it wrongly
+    is silent: every chunk simply comes out at a plausible wrong scale.
+
+    Sent only when the agent's handshake sets ``wants_actions``; see
+    :meth:`RemoteAgent.actions_taken`.
+    """
+
+    step_id: int
+    actions: FloatArray
+    raw_actions: FloatArray | None = None
+    action_horizon: int | None = None
+
+    def __post_init__(self) -> None:
+        assert self.actions.ndim == 2, f"actions must be (chunk, dim), got shape {self.actions.shape}"
+        assert self.raw_actions is None or self.raw_actions.ndim == 2, (
+            f"raw_actions must be (chunk, dim), got shape {None if self.raw_actions is None else self.raw_actions.shape}"
+        )
+        assert self.action_horizon is None or self.action_horizon >= 1, (
+            f"action_horizon must be positive, got {self.action_horizon}"
+        )
+
+    def to_payload(self) -> ProtocolPayload:
+        payload: ProtocolPayload = {
+            STEP_ID_KEY: int(self.step_id),
+            ACTIONS_KEY: np.ascontiguousarray(self.actions, dtype=np.float32),
+        }
+        if self.raw_actions is not None:
+            payload[RAW_ACTIONS_KEY] = np.ascontiguousarray(self.raw_actions, dtype=np.float32)
+        if self.action_horizon is not None:
+            payload[ACTION_HORIZON_KEY] = int(self.action_horizon)
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> ProducedActions:
+        raw = payload.get(RAW_ACTIONS_KEY)
+        horizon = payload.get(ACTION_HORIZON_KEY)
+        return cls(
+            step_id=int(payload[STEP_ID_KEY]),
+            actions=np.asarray(payload[ACTIONS_KEY], dtype=np.float32),
+            raw_actions=None if raw is None else np.asarray(raw, dtype=np.float32),
+            action_horizon=None if horizon is None else int(horizon),
+        )
+
+
+@dataclass(frozen=True)
 class Transition:
     """One RL step: what happened between two consecutive ``act`` calls.
 
@@ -190,17 +255,29 @@ class Transition:
 @dataclass(frozen=True)
 class AgentHandshake:
     """First frame the agent sends, so the server can reject a shape mismatch loudly
-    instead of feeding the denoiser a wrongly shaped latent."""
+    instead of feeding the denoiser a wrongly shaped latent.
+
+    ``wants_actions`` is how a recording learner opts in to :class:`ProducedActions`.
+    Negotiating it here rather than always sending keeps the extension free in both
+    directions: an agent written before it simply omits the key and defaults to off, and
+    a server written before it ignores the key and never sends, which a new agent sees as
+    "no actions recorded" rather than as a hang.
+    """
 
     latent_shape: tuple[int, int]
     agent_id: str = ""
+    wants_actions: bool = False
 
     def __post_init__(self) -> None:
         assert len(self.latent_shape) == 2, f"latent_shape must be 2-D, got {self.latent_shape}"
         assert all(dim > 0 for dim in self.latent_shape), f"latent_shape dims must be positive, got {self.latent_shape}"
 
     def to_payload(self) -> ProtocolPayload:
-        return {LATENT_SHAPE_KEY: list(self.latent_shape), AGENT_ID_KEY: self.agent_id}
+        return {
+            LATENT_SHAPE_KEY: list(self.latent_shape),
+            AGENT_ID_KEY: self.agent_id,
+            WANTS_ACTIONS_KEY: bool(self.wants_actions),
+        }
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> AgentHandshake:
@@ -208,7 +285,11 @@ class AgentHandshake:
         assert isinstance(raw, (list, tuple)) and len(raw) == 2, f"{LATENT_SHAPE_KEY} must be a 2-item list"
         agent_id = payload.get(AGENT_ID_KEY, "")
         assert isinstance(agent_id, str), f"{AGENT_ID_KEY} must be str"
-        return cls(latent_shape=(int(raw[0]), int(raw[1])), agent_id=agent_id)
+        return cls(
+            latent_shape=(int(raw[0]), int(raw[1])),
+            agent_id=agent_id,
+            wants_actions=bool(payload.get(WANTS_ACTIONS_KEY, False)),
+        )
 
 
 @runtime_checkable
@@ -240,13 +321,41 @@ class RLAgent(Protocol):
 
     All methods are async because the inference server calls them from its event loop:
     a blocking call there stalls WebSocket keepalives and drops the robot connection.
+
+    **These members are the whole requirement, and adding one is a breaking change.** This
+    package runs under ``beartype_this_package()``, so this ``runtime_checkable`` Protocol
+    is enforced on every call annotated with it, ``serve_agent`` included. A member added
+    here does not degrade gracefully for agents that predate it: it rejects them at the
+    door, and those agents live in other repositories.
+
+    That is why the action-recording extension is *not* here. An agent opts in by defining
+    two members of its own::
+
+        @property
+        def wants_actions(self) -> bool: ...          # True to receive chunks
+        async def actions_taken(self, produced: ProducedActions) -> None: ...
+
+    Both are looked up with ``getattr``, so an agent that defines neither is served exactly
+    as it was before the extension existed. See :class:`ProducedActions`.
     """
 
     async def act(self, step_id: int, observation: AgentObservation) -> AgentAction: ...
 
     async def observe(self, transition: Transition) -> None: ...
 
-    async def episode_end(self, reason: str) -> None: ...
+    async def episode_end(
+        self,
+        reason: str,
+        *,
+        final_step_id: int | None = None,
+        final_observation: AgentObservation | None = None,
+        executed_steps: int | None = None,
+    ) -> None:
+        """Finish an episode, optionally reporting the final executed chunk.
+
+        The optional fields are all-or-none. They close the transition from the most
+        recent :meth:`act` call to the robot's observation at episode end.
+        """
 
     async def connection_closed(self) -> None:
         """The server went away mid-episode; discard anything in flight.
@@ -282,7 +391,21 @@ class NullAgent:
     async def observe(self, transition: Transition) -> None:
         return None
 
-    async def episode_end(self, reason: str) -> None:
+    async def actions_taken(self, produced: ProducedActions) -> None:
+        return None
+
+    @property
+    def wants_actions(self) -> bool:
+        return False
+
+    async def episode_end(
+        self,
+        reason: str,
+        *,
+        final_step_id: int | None = None,
+        final_observation: AgentObservation | None = None,
+        executed_steps: int | None = None,
+    ) -> None:
         return None
 
     async def connection_closed(self) -> None:
@@ -301,7 +424,9 @@ class RandomLatentAgent(NullAgent):
         assert scale > 0, f"scale must be positive, got {scale}"
         self._scale = scale
         self.transitions: list[Transition] = []
+        self.produced_actions: list[ProducedActions] = []
         self.episodes: list[str] = []
+        self.episode_terminals: list[tuple[int, AgentObservation, int] | None] = []
         self.disconnects = 0
 
     async def act(self, step_id: int, observation: AgentObservation) -> AgentAction:
@@ -320,9 +445,37 @@ class RandomLatentAgent(NullAgent):
         )
         self.transitions.append(transition)
 
-    async def episode_end(self, reason: str) -> None:
+    async def actions_taken(self, produced: ProducedActions) -> None:
+        LOGGER.info(
+            "actions_taken step=%d actions=%s raw=%s horizon=%s",
+            produced.step_id, produced.actions.shape,
+            None if produced.raw_actions is None else produced.raw_actions.shape,
+            produced.action_horizon,
+        )
+        self.produced_actions.append(produced)
+
+    @property
+    def wants_actions(self) -> bool:
+        return True
+
+    async def episode_end(
+        self,
+        reason: str,
+        *,
+        final_step_id: int | None = None,
+        final_observation: AgentObservation | None = None,
+        executed_steps: int | None = None,
+    ) -> None:
+        supplied = (final_step_id is not None, final_observation is not None, executed_steps is not None)
+        assert all(supplied) or not any(supplied), "terminal telemetry fields must be supplied together"
         LOGGER.info("episode_end reason=%r after %d transitions", reason, len(self.transitions))
         self.episodes.append(reason)
+        if all(supplied):
+            assert final_step_id is not None and final_observation is not None and executed_steps is not None
+            assert executed_steps >= 1, f"executed_steps must be positive, got {executed_steps}"
+            self.episode_terminals.append((final_step_id, final_observation, executed_steps))
+        else:
+            self.episode_terminals.append(None)
 
     async def connection_closed(self) -> None:
         LOGGER.info("connection closed")
@@ -403,8 +556,44 @@ class RemoteAgent:
     async def observe(self, transition: Transition) -> None:
         await self._call({METHOD_KEY: METHOD_OBSERVE, **transition.to_payload()})
 
-    async def episode_end(self, reason: str) -> None:
-        await self._call({METHOD_KEY: METHOD_EPISODE_END, REASON_KEY: reason})
+    @property
+    def wants_actions(self) -> bool:
+        assert self._handshake is not None, "call connect() before reading wants_actions"
+        return self._handshake.wants_actions
+
+    async def actions_taken(self, produced: ProducedActions) -> None:
+        """Send the denoised chunk, but only to a learner that asked for it.
+
+        Gated on the handshake so this costs nothing for agents that do not record: the
+        chunk is a few tens of KB per query and every send is a round trip taken on the
+        same lock ``act`` uses, i.e. it lands squarely in the robot's control loop.
+        """
+        await self.connect()
+        assert self._handshake is not None
+        if not self._handshake.wants_actions:
+            return
+        await self._call({METHOD_KEY: METHOD_ACTIONS, **produced.to_payload()})
+
+    async def episode_end(
+        self,
+        reason: str,
+        *,
+        final_step_id: int | None = None,
+        final_observation: AgentObservation | None = None,
+        executed_steps: int | None = None,
+    ) -> None:
+        supplied = (final_step_id is not None, final_observation is not None, executed_steps is not None)
+        assert all(supplied) or not any(supplied), "terminal telemetry fields must be supplied together"
+        payload: ProtocolPayload = {METHOD_KEY: METHOD_EPISODE_END, REASON_KEY: reason}
+        if all(supplied):
+            assert final_step_id is not None and final_observation is not None and executed_steps is not None
+            assert executed_steps >= 1, f"executed_steps must be positive, got {executed_steps}"
+            payload.update({
+                STEP_ID_KEY: int(final_step_id),
+                OBSERVATION_KEY: final_observation.to_payload(),
+                EXECUTED_STEPS_KEY: int(executed_steps),
+            })
+        await self._call(payload)
 
 
 async def handle_agent_connection(connection: Any, agent: RLAgent) -> None:
@@ -418,6 +607,9 @@ async def handle_agent_connection(connection: Any, agent: RLAgent) -> None:
             AgentHandshake(
                 latent_shape=agent.latent_shape,
                 agent_id=type(agent).__name__,
+                # getattr, not agent.wants_actions: agents written against the earlier
+                # protocol define neither member and must keep working untouched.
+                wants_actions=bool(getattr(agent, "wants_actions", False)),
             ).to_payload()
         )
     )
@@ -433,10 +625,35 @@ async def handle_agent_connection(connection: Any, agent: RLAgent) -> None:
             elif method == METHOD_OBSERVE:
                 await agent.observe(Transition.from_payload(payload))
                 await connection.send(serialize_to_msgpack({"status": "ok"}))
+            elif method == METHOD_ACTIONS:
+                handler = getattr(agent, "actions_taken", None)
+                if handler is not None:
+                    await handler(ProducedActions.from_payload(payload))
+                await connection.send(serialize_to_msgpack({"status": "ok"}))
             elif method == METHOD_EPISODE_END:
                 reason = payload.get(REASON_KEY, "")
                 assert isinstance(reason, str), f"{REASON_KEY} must be str"
-                await agent.episode_end(reason)
+                terminal_fields = (
+                    STEP_ID_KEY in payload,
+                    OBSERVATION_KEY in payload,
+                    EXECUTED_STEPS_KEY in payload,
+                )
+                assert all(terminal_fields) or not any(terminal_fields), (
+                    "terminal telemetry fields must be supplied together"
+                )
+                if all(terminal_fields):
+                    executed_steps = int(payload[EXECUTED_STEPS_KEY])
+                    assert executed_steps >= 1, (
+                        f"{EXECUTED_STEPS_KEY} must be positive, got {executed_steps}"
+                    )
+                    await agent.episode_end(
+                        reason,
+                        final_step_id=int(payload[STEP_ID_KEY]),
+                        final_observation=AgentObservation.from_payload(payload[OBSERVATION_KEY]),
+                        executed_steps=executed_steps,
+                    )
+                else:
+                    await agent.episode_end(reason)
                 await connection.send(serialize_to_msgpack({"status": "ok"}))
             else:
                 await connection.send(serialize_to_msgpack({"error": f"unknown method {method!r}"}))
@@ -470,6 +687,7 @@ __all__ = [
     "DEFAULT_AGENT_PORT",
     "LatentPolicyBackend",
     "NullAgent",
+    "ProducedActions",
     "RLAgent",
     "RandomLatentAgent",
     "RemoteAgent",

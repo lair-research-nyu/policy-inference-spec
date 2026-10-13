@@ -12,8 +12,11 @@ dependencies = [
     "torch>=2.0",
     "websockets>=15.0.1",
     "opencv-contrib-python-headless==4.10.*",
-    "av>=16.0.1",
+    # Upper bound tracks lerobot's av-dep extra (av>=15,<16); a wider range here
+    # makes `pip install -e . lerobot[dataset]` unsatisfiable.
+    "av>=15.0.0,<16.0.0",
     "pandas>=2.2",
+    "pyarrow>=14",
     "rerun-sdk[all]==0.30.2",
     "typer==0.12.*",
     "click<8.2.0",

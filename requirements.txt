@@ -1,18 +1,61 @@
-accelerate==1.13.0
-aiohappyeyeballs==2.6.2
-aiohttp==3.13.5
+# Frozen from a verified-working environment (uv pip freeze).
+#
+# Install:
+#   uv venv --python 3.12
+#   uv pip install torch==2.10.0+cu128 torchvision==0.25.0+cu128 \
+#       --index-url https://download.pytorch.org/whl/cu128
+#   uv pip install -r requirements.txt
+#
+# Install the torch wheels first: they carry a +cu128 local version and are
+# published only on the PyTorch index, and uv resolves each package from the
+# first index that publishes it (that index also serves a stale `requests`,
+# which makes a single combined install unsatisfiable).
+#
+# Three items here are load-bearing -- do not "upgrade" them casually:
+#
+#   lerobot==0.6.0  Must stay >=0.6.0. Upstream scaled pi0's image and language
+#                   embeddings by sqrt(hidden_size) between 2026-02-23 and
+#                   2026-05-05, and the PyPI 0.5.0 release sits inside that
+#                   window. The checkpoints in models/ were trained without the
+#                   scaling, so serving them on 0.5.0 collapses every predicted
+#                   action onto the dataset mean (the robot lunges to one fixed
+#                   pose). The version string alone does not tell you which you
+#                   have -- upstream main kept reporting "0.5.0" for months
+#                   after the fix. Check the code:
+#                     grep "pooler_output \*" \
+#                       .venv/lib/python*/site-packages/lerobot/policies/pi0/modeling_pi0.py
+#                   A match means you have the broken build.
+#
+#   lerobot patch   The wheel alone is NOT enough to serve an rtc-train
+#                   checkpoint (models/*-rtctrain-*). Stock 0.6.0 has no
+#                   train-time RTC: PI0Config/PI05Config lack the rtc_train_*
+#                   fields, so loading such a checkpoint logs "Dropping
+#                   config.json keys not defined on PI0Config" and
+#                   server.py::_configure_rtc_train then fails the --rtc-train
+#                   guard. Apply the same patch the checkpoints were trained
+#                   with, and re-apply after every lerobot (re)install --
+#                   pip/uv restore the pristine wheel and revert it silently:
+#                     bash scripts/apply_lerobot_rtc_train_patch.sh
+#                   Check the code:
+#                     grep rtc_train_enabled \
+#                       .venv/lib/python*/site-packages/lerobot/policies/pi0/configuration_pi0.py
+#                   No match means the patch is missing.
+#
+#   torchcodec      Must be the plain PyPI build, NOT 0.10.0+cu128. The cu128
+#                   build cannot load its FFmpeg shared libraries, which breaks
+#                   LeRobotDataset video decoding.
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
 aiosignal==1.4.0
-annotated-doc==0.0.4
-annotated-types==0.7.0
-anyio==4.13.0
+anyio==4.14.2
 anywidget==0.11.0
-asttokens==3.0.1
+asttokens==3.0.2
 attrs==26.1.0
-av==17.0.1
+av==15.1.0
 beartype==0.22.9
-certifi==2026.5.20
-charset-normalizer==3.4.7
-click==8.4.1
+certifi==2026.7.22
+charset-normalizer==3.4.9
+click==8.1.8
 cloudpickle==3.1.2
 cmake==4.1.3
 comm==0.2.3
@@ -20,45 +63,37 @@ cuda-bindings==12.9.4
 cuda-pathfinder==1.2.2
 datafusion==50.1.0
 datasets==4.8.5
-debugpy==1.8.20
-decorator==5.3.1
-deepdiff==8.6.2
-diffusers==0.35.2
+debugpy==1.8.21
 dill==0.4.1
 draccus==0.10.0
 einops==0.8.2
-evdev==1.9.3
 executing==2.2.1
-Farama-Notifications==0.0.6
+farama-notifications==0.0.6
 filelock==3.29.0
 frozenlist==1.8.0
 fsspec==2026.2.0
-gitdb==4.0.12
-GitPython==3.1.50
 gymnasium==1.3.0
 h11==0.16.0
-hf-xet==1.5.0
+h5py==3.16.0
+hf-xet==1.6.0
 httpcore==1.0.9
 httpx==0.28.1
-huggingface_hub==1.16.4
-idna==3.16
-ImageIO==2.37.3
-imageio-ffmpeg==0.6.0
-importlib_metadata==9.0.0
+huggingface-hub==1.13.0
+idna==3.18
 ipykernel==6.31.0
-ipython==9.13.0
-ipython_pygments_lexers==1.1.1
+ipython==9.16.1
+ipython-pygments-lexers==1.1.1
 ipywidgets==8.1.8
 jedi==0.20.0
-Jinja2==3.1.6
+jinja2==3.1.6
 jsonlines==4.0.0
+jupyter-client==8.9.1
+jupyter-core==5.9.1
 jupyter-ui-poll==1.1.0
-jupyter_client==8.8.0
-jupyter_core==5.9.1
-jupyterlab_widgets==3.0.16
-lerobot @ git+https://github.com/huggingface/lerobot.git@24017e960c39a24fe1b6ea6248522460fa5aa4b3
+jupyterlab-widgets==3.0.16
+lerobot==0.6.0
 markdown-it-py==4.2.0
-MarkupSafe==3.0.3
+markupsafe==3.0.3
 matplotlib-inline==0.2.2
 mdurl==0.1.2
 mergedeep==1.3.4
@@ -66,7 +101,7 @@ mpmath==1.3.0
 msgspec==0.21.1
 multidict==6.7.1
 multiprocess==0.70.19
-mypy_extensions==1.1.0
+mypy-extensions==1.1.0
 nest-asyncio==1.6.0
 networkx==3.6.1
 numpy==2.1.3
@@ -86,69 +121,58 @@ nvidia-nvjitlink-cu12==12.8.93
 nvidia-nvshmem-cu12==3.4.5
 nvidia-nvtx-cu12==12.8.90
 opencv-contrib-python-headless==4.10.0.84
-opencv-python-headless==4.12.0.88
-orderly-set==5.5.0
+opencv-python-headless==4.13.0.92
 packaging==25.0
-pandas==3.0.3
+pandas==2.3.3
 parso==0.8.7
 pexpect==4.9.0
 pillow==12.2.0
-platformdirs==4.9.6
--e git+https://github.com/lair-research-nyu/policy-inference-spec.git@796cecc19f4040c1c09d56395f2a93d8a85b1538#egg=policy_inference_spec
-prompt_toolkit==3.0.52
+platformdirs==4.11.0
+-e .
+prompt-toolkit==3.0.53
 propcache==0.5.2
-protobuf==6.33.6
 psutil==7.2.2
 psygnal==0.15.1
 ptyprocess==0.7.0
-pure_eval==0.2.3
-pyarrow==24.0.0
-pydantic==2.13.4
-pydantic_core==2.46.4
-Pygments==2.20.0
-pynput==1.8.2
-pyserial==3.5
+pure-eval==0.2.3
+pyarrow==25.0.0
+pygments==2.20.0
 python-dateutil==2.9.0.post0
-python-xlib==0.33
-PyYAML==6.0.3
+pytz==2026.3.post1
+pyyaml==6.0.3
 pyyaml-include==1.4.1
 pyzmq==27.1.0
-regex==2026.5.9
+regex==2026.7.19
 requests==2.34.2
 rerun-notebook==0.30.2
 rerun-sdk==0.30.2
 rich==15.0.0
-safetensors==0.7.0
-scipy==1.17.1
-sentry-sdk==2.60.0
-setuptools==80.10.2
+safetensors==0.8.0
+scipy==1.18.0
+setuptools==78.1.0
 shellingham==1.5.4
 simplejpeg==1.9.0
 six==1.17.0
-smmap==5.0.3
 stack-data==0.6.3
 sympy==1.14.0
 termcolor==3.3.0
 tokenizers==0.22.2
 toml==0.10.2
 torch==2.10.0+cu128
-torchcodec==0.10.0+cu128
+torchcodec==0.10.0
 torchvision==0.25.0+cu128
-tornado==6.5.6
-tqdm==4.67.3
-traitlets==5.15.0
+tornado==6.5.7
+tqdm==4.70.0
+traitlets==5.16.1
 transformers==5.5.4
 triton==3.6.0
-typer==0.25.1
+typer==0.12.5
+typing-extensions==4.15.0
 typing-inspect==0.9.0
-typing-inspection==0.4.2
-typing_extensions==4.15.0
+tzdata==2026.3
 urllib3==2.7.0
-wandb==0.24.2
-wcwidth==0.7.0
-websockets==16.0
-wheel==0.46.3
+wcwidth==0.8.2
+websockets==17.0.1
 widgetsnbextension==4.0.15
-xxhash==3.7.0
-yarl==1.24.2
-zipp==4.1.0
+xxhash==3.8.1
+yarl==1.24.5
