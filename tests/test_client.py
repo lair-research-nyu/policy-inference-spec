@@ -38,6 +38,7 @@ from policy_inference_spec.protocol import (
     OBSERVATION_HISTORY_VALUES_KEY,
     PREV_SKIPPED_ACTION_START_KEY,
     PREFIX_CHANGE_START_KEY,
+    POLICY_CONFIGURATION_KEY,
     POLICY_ID_KEY,
     Q_VALUE_KEY,
     REWARD_KEY,
@@ -300,7 +301,18 @@ async def test_predict_includes_prev_skipped_action_start() -> None:
 
 
 @pytest.mark.asyncio
-async def test_predict_preserves_start_metadata() -> None:
+@pytest.mark.parametrize(
+    "policy_configuration",
+    [
+        {},
+        {
+            "strategy": "ensemble",
+            "members": ["a", "b"],
+            "options": {"enabled": True, "temperature": 0.5, "fallback": None},
+        },
+    ],
+)
+async def test_predict_preserves_policy_configuration_and_start_metadata(policy_configuration: dict[str, Any]) -> None:
     cfg = serialize_to_msgpack(_server_handshake_payload())
     resp = serialize_to_msgpack(
         {
@@ -318,6 +330,7 @@ async def test_predict_preserves_start_metadata() -> None:
 
     frame = _valid_wire_frame()
     frame[START_METADATA_KEY] = {"item_index": 2, "pick_location": "table"}
+    frame[POLICY_CONFIGURATION_KEY] = policy_configuration
     with patch("policy_inference_spec.client.websockets.connect", side_effect=fake_connect):
         client = RemotePolicyClient("ws://127.0.0.1:9/ws")
         await client.predict(frame)
@@ -327,6 +340,16 @@ async def test_predict_preserves_start_metadata() -> None:
     assert await_args is not None
     sent_payload = deserialize_from_msgpack(await_args.args[0])
     assert sent_payload[START_METADATA_KEY] == {"item_index": 2, "pick_location": "table"}
+    assert sent_payload[POLICY_CONFIGURATION_KEY] == policy_configuration
+    assert frame[START_METADATA_KEY] == {"item_index": 2, "pick_location": "table"}
+
+
+@pytest.mark.parametrize("value", [None, "policy-a", [], {"nested": {"weights": b"binary"}}, {1: "value"}])
+def test_validate_wire_inference_request_frame_rejects_invalid_policy_configuration(value: Any) -> None:
+    frame = _valid_wire_frame()
+    frame[POLICY_CONFIGURATION_KEY] = value
+    with pytest.raises(AssertionError, match=POLICY_CONFIGURATION_KEY):
+        validate_wire_inference_request_frame(frame)
 
 
 @pytest.mark.asyncio

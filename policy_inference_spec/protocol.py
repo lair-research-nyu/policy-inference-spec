@@ -29,6 +29,7 @@ PREV_SKIPPED_ACTION_START_KEY = "prev_skipped_action_start"
 # Request metadata keys
 MODEL_ID_KEY = "model_id"
 POLICY_ID_KEY = "policy_id"
+POLICY_CONFIGURATION_KEY = "policy_configuration"
 TASK_KEY = "task"
 SUBTASK_KEY = "subtask"
 START_METADATA_KEY = "start_metadata"
@@ -217,6 +218,7 @@ __all__ = [
     "N_EXTERNAL_CAMERAS_KEY",
     "NEEDS_WRIST_CAMERA_KEY",
     "POLICY_ID_KEY",
+    "POLICY_CONFIGURATION_KEY",
     "PREV_SKIPPED_ACTION_START_KEY",
     "PREFIX_CHANGE_START_KEY",
     "ProtocolPayload",
