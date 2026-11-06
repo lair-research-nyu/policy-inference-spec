@@ -9,6 +9,10 @@
 #       --rl-agent-url ws://127.0.0.1:18091 --host 0.0.0.0 --port 18090
 #   (no --rtc-train: a pinned prefix would override the rows the latent produced)
 #
+# REPLAY A RECORDING ON THE ROBOT (no model is loaded; see server/trajectory_replay.py):
+#   PYTHONPATH=. ~/projects/lair-openpi/.venv/bin/python -m server.server_openpi \
+#       --replay cubestack-recording.rrd --host 0.0.0.0 --port 18090
+#
 # The same wire protocol as server.server, with the lerobot forward pass replaced by
 # openpi's (JAX), for checkpoints trained by lair-train-pipeline on the lair-openpi fork
 # (https://github.com/lair-research-nyu/lair-openpi). The robot client is unchanged.
@@ -30,6 +34,9 @@
 #     noise from the policy's prefix embedding and learns from the transitions; same
 #     learner protocol, same agent images, same observation dump. See
 #     server/openpi_latent.py. Mutually exclusive with --rtc-train, as in server.server.
+#   * --kv-ema-alpha (openpi only, experimental): an exponential moving average of the
+#     prefix KV cache over the requests of one connection; see server/openpi_kv_ema.py.
+#     It resets with the same resume rules as the RTC prefix. Not with --rl-agent-url.
 # Not carried over: inference-time RTC guidance (--rtc), temporal ensembling, state pins.
 # None of them has an openpi implementation here.
 #
@@ -106,6 +113,17 @@ from policy_inference_spec.rl import (
     RLAgent,
     Transition,
 )
+from server.openpi_kv_ema import TARGETS as KV_EMA_TARGETS
+from server.openpi_kv_ema import TOKEN_MODES as KV_EMA_TOKEN_MODES
+from server.openpi_kv_ema import KvEmaConfig, KvEmaMemory
+from server.trajectory_replay import (
+    DEFAULT_APPROACH_DEG_S,
+    DEFAULT_EXTRACT_PYTHON,
+    DEFAULT_REPLAY_HZ,
+    ReplayConfig,
+    ReplayState,
+    load_trajectory,
+)
 from server.prompts import (
     _PROMPT_FIELD_NAMES,
     _check_prompt_source,
@@ -121,6 +139,9 @@ DEFAULT_ACTION_HORIZON = 50
 DEFAULT_MODEL_ACTION_HORIZON = 50
 DEFAULT_NUM_STEPS = 10
 DEFAULT_RESUME_GAP_S = 1.0
+# --max-step-deg under --replay: above the fastest step of the teleop recordings measured
+# (GEN2-105-*.rrd: 9.2 deg/step), so a recording plays back exactly; still catches a glitch.
+DEFAULT_REPLAY_MAX_STEP_DEG = 10.0
 # lair-train-pipeline's model.rtc defaults: d ~ U[min_delay, max_delay).
 DEFAULT_RTC_TRAIN_MIN_DELAY = 0
 DEFAULT_RTC_TRAIN_MAX_DELAY = 15
@@ -160,6 +181,7 @@ class ChunkPolicy(Protocol):
     rtc_train: bool
     rtc_train_min_delay: int
     rtc_train_max_delay: int
+    kv_ema: KvEmaConfig | None  # None: the KV cache is used as computed
 
     def predict(
         self,
@@ -168,9 +190,11 @@ class ChunkPolicy(Protocol):
         prompt: str,
         *,
         prefix: np.ndarray | None,
+        kv_memory: KvEmaMemory | None = None,
     ) -> np.ndarray:
         """(action_horizon, robot action dim) robot-space chunk. ``prefix`` is a robot-space
-        (d, action dim) block of committed actions to pin at the start, or None."""
+        (d, action dim) block of committed actions to pin at the start, or None.
+        ``kv_memory`` is the connection's KV-cache average, required iff ``kv_ema`` is set."""
         ...
 
     def latent_backend(self) -> "LatentBackend":
@@ -257,6 +281,7 @@ class OpenpiChunkPolicy:
         num_steps: int = DEFAULT_NUM_STEPS,
         max_token_len: int | None = None,
         asset_id: str | None = None,
+        kv_ema: KvEmaConfig | None = None,
     ) -> None:
         # Deferred so the connection handler can be imported (and tested) without JAX.
         import jax.numpy as jnp
@@ -316,6 +341,13 @@ class OpenpiChunkPolicy:
         self.rtc_train = rtc_train
         self.rtc_train_min_delay = rtc_train_min_delay if rtc_train else 0
         self.rtc_train_max_delay = rtc_train_max_delay if rtc_train else 0
+        self.kv_ema = kv_ema
+        self._kv_ema_sampler = None
+        if kv_ema is not None:
+            from server.openpi_kv_ema import KvEmaSampler
+
+            self._kv_ema_sampler = KvEmaSampler(self._policy, kv_ema, num_steps=num_steps)
+            LOGGER.warning("KV-CACHE EMA ON (experimental): %s", kv_ema.describe())
         LOGGER.info(
             "loaded %s: %s, model action dim %d (robot %d), horizon %d, %d denoise steps, "
             "%s normalization from %s, rtc_train=%s%s",
@@ -331,6 +363,7 @@ class OpenpiChunkPolicy:
         prompt: str,
         *,
         prefix: np.ndarray | None,
+        kv_memory: KvEmaMemory | None = None,
     ) -> np.ndarray:
         obs = openpi_obs(images, state, prompt)
         if self.rtc_train:
@@ -350,7 +383,11 @@ class OpenpiChunkPolicy:
             obs["prefix_len"] = d
         else:
             assert prefix is None, "a prefix reached a policy served without --rtc-train"
-        out = self._policy.infer(obs)
+        if self._kv_ema_sampler is None:
+            out = self._policy.infer(obs)
+        else:
+            assert kv_memory is not None, "--kv-ema-alpha needs the connection's KvEmaMemory"
+            out = self._kv_ema_sampler.infer(obs, kv_memory)
         return np.asarray(out["actions"][:, : self.robot_action_dim], dtype=np.float32)
 
     def latent_backend(self):
@@ -399,6 +436,23 @@ class ServerOptions:
     action_limits: ActionLimits | None = None
     one_shot: bool = False
     rl: RlRuntime | None = None
+    expo: Any = None  # expo_ft.ultra.runtime.ExpoRuntime with --expo-ft, else None
+    replay: ReplayConfig | None = None  # --replay: answer with a recording, not the model
+
+
+@dataclass
+class ReplayPolicy:
+    """Stands in for the model under --replay: it only names the chunks (policy_id)."""
+
+    policy_id: str
+    action_horizon: int = DEFAULT_ACTION_HORIZON
+    rtc_train: bool = False
+    rtc_train_min_delay: int = 0
+    rtc_train_max_delay: int = 0
+    kv_ema: KvEmaConfig | None = None
+
+    def predict(self, *args: Any, **kwargs: Any) -> np.ndarray:
+        raise AssertionError("--replay serves recorded chunks; the model is never called")
 
 
 @dataclass
@@ -439,6 +493,30 @@ class _RtcState:
         # One-shot: the next request ignores any prefix it carries, because nothing this
         # connection knows of is committed. True on a fresh connection and after reset().
         self.resume_pending = True
+
+
+class _KvEmaState:
+    """Per-connection KV-cache average (--kv-ema-alpha). Reset by the same events that
+    make an RTC prefix stale: a new connection, ``done``, an intervention, or a request
+    gap of --resume-gap-s -- after any of them the previous frames are not the recent past."""
+
+    def __init__(self) -> None:
+        self.memory = KvEmaMemory()
+        self.last_arrival_s: float | None = None
+
+    def reset(self) -> None:
+        self.memory.reset()
+
+    def before_request(self, opts: "ServerOptions", *, req_id: int) -> str:
+        """Apply the gap rule; return a log label."""
+        now = time.perf_counter()
+        gap_s = None if self.last_arrival_s is None else now - self.last_arrival_s
+        self.last_arrival_s = now
+        if opts.resume_gap_s is not None and gap_s is not None and gap_s >= opts.resume_gap_s \
+                and not self.memory.empty:
+            LOGGER.warning("predict req=%d kv EMA reset after a %.1fs gap in requests", req_id, gap_s)
+            self.memory.reset()
+        return f"kv_ema={'start' if self.memory.empty else f'step{self.memory.steps}'}"
 
 
 def _resolve_prefix(
@@ -513,6 +591,7 @@ def _inference_response(
     opts: ServerOptions,
     *,
     prompt: str,
+    kv: _KvEmaState | None = None,
 ) -> dict[str, Any]:
     req_id = next(_REQUEST_COUNTER)
     state = _wire_state_25(frame[JOINT_STATE_KEY].astype(np.float32))
@@ -521,10 +600,24 @@ def _inference_response(
     prefix, debug = (None, "rtc_train=disabled")
     if policy.rtc_train:
         prefix, debug = _resolve_prefix(frame, rtc, policy, opts, req_id=req_id)
+    kv_kwargs = {}
+    if getattr(policy, "kv_ema", None) is not None:
+        assert kv is not None, "a --kv-ema-alpha policy needs the connection's _KvEmaState"
+        debug += " " + kv.before_request(opts, req_id=req_id)
+        kv_kwargs["kv_memory"] = kv.memory
 
     t0 = time.perf_counter()
+    q_value = None
     with _PREDICT_LOCK:
-        chunk = policy.predict(images, state, prompt, prefix=prefix)
+        if opts.expo is not None:
+            prev = frame.get(PREV_SKIPPED_ACTION_START_KEY)
+            chunk = opts.expo.predict(images, state, prompt, prefix=prefix,
+                                      prev_executed=None if prev is None else int(prev))
+            info = opts.expo.last_info
+            q_value = info["q_max"]
+            debug += f" expo idx={info['idx']}{'(edit)' if info['edited'] else ''} q={q_value:.3f}"
+        else:
+            chunk = policy.predict(images, state, prompt, prefix=prefix, **kv_kwargs)
     inference_time_s = time.perf_counter() - t0
 
     committed = 0 if prefix is None else len(prefix)
@@ -536,9 +629,12 @@ def _inference_response(
             LOGGER.warning("predict req=%d chunk does not reproduce its prefix: max |diff| %.4f",
                            req_id, drift)
     resp = _respond(frame, policy, opts, state=state, chunk=chunk, committed=committed,
-                    inference_time_s=inference_time_s, req_id=req_id, prompt=prompt, debug=debug)
+                    inference_time_s=inference_time_s, req_id=req_id, prompt=prompt, debug=debug,
+                    q_value=q_value)
     if policy.rtc_train:
         rtc.last_chunk = resp[ACTION_KEY].copy()
+    if opts.expo is not None:
+        opts.expo.record_sent(resp[ACTION_KEY])  # what the robot executes: after the limiter
     return resp
 
 
@@ -555,16 +651,26 @@ def _respond(
     prompt: str,
     debug: str,
     q_value: float | None = None,
+    lead: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Truncate, limit and package one chunk: the part every predict path shares."""
+    """Truncate, limit and package one chunk: the part every predict path shares.
+
+    ``lead``: the command the robot ran just before this chunk's row 0, if known. Row 0 is
+    then rate-limited against it like any other step, instead of offset-limited against
+    the live state."""
     action = chunk[: opts.action_horizon]
 
-    if opts.action_limits is not None:
+    if opts.action_limits is not None and lead is not None and committed == 0:
+        limited, report = limit_chunk(
+            np.vstack([lead[None, :], action]), state, opts.action_limits, committed_prefix_len=1,
+        )
+        action = limited[1:]
+    elif opts.action_limits is not None:
         action, report = limit_chunk(
             action, state, opts.action_limits, committed_prefix_len=min(committed, len(action)),
         )
-        if report.triggered:
-            LOGGER.warning("predict req=%d ACTION LIMITER fired: %s", req_id, report.describe(GEN2_DIM_NAMES))
+    if opts.action_limits is not None and report.triggered:
+        LOGGER.warning("predict req=%d ACTION LIMITER fired: %s", req_id, report.describe(GEN2_DIM_NAMES))
 
     LOGGER.info(
         "predict req=%d prompt=%r %s chunk=%d returned=%d inference_s=%.3f "
@@ -576,7 +682,7 @@ def _respond(
         ACTION_KEY: action,
         INFERENCE_TIME_KEY: inference_time_s,
         POLICY_ID_KEY: policy.policy_id,
-        RL_ENABLED_KEY: opts.rl is not None,
+        RL_ENABLED_KEY: opts.rl is not None or opts.expo is not None,
         Q_VALUE_KEY: 0.0 if q_value is None else float(q_value),
     }
     # Echo the caller's ID so a reply left buffered by a cancelled request can be told
@@ -584,6 +690,27 @@ def _respond(
     if CHUNK_ID_KEY in frame:
         resp[CHUNK_ID_KEY] = frame[CHUNK_ID_KEY]
     validate_wire_inference_response(resp)
+    return resp
+
+
+def _replay_response(
+    frame: dict[str, Any],
+    replay: ReplayState,
+    policy: ChunkPolicy,
+    opts: ServerOptions,
+    *,
+    prompt: str,
+) -> dict[str, Any]:
+    """--replay: the next slice of the recording, through the same limiter and packaging."""
+    req_id = next(_REQUEST_COUNTER)
+    state = _wire_state_25(frame[JOINT_STATE_KEY].astype(np.float32))
+    t0 = time.perf_counter()
+    out = replay.next_chunk(frame, state, horizon=opts.action_horizon)
+    resp = _respond(frame, policy, opts, state=state, chunk=out.chunk, committed=out.committed,
+                    inference_time_s=time.perf_counter() - t0, req_id=req_id, prompt=prompt,
+                    debug=out.debug, lead=out.lead)
+    # What the robot executes is the limited chunk; the next request's prefix is its tail.
+    replay.last_sent = np.asarray(resp[ACTION_KEY], dtype=np.float32).copy()
     return resp
 
 
@@ -698,6 +825,20 @@ async def _rl_episode_end(frame: dict[str, Any], rl_state: _RlState, rl: RlRunti
     )
 
 
+def _expo_episode_end(frame: dict[str, Any], expo: Any) -> dict:
+    """endpoint=done for EXPO-FT: the terminal observation when the robot sent one."""
+    prev = frame.get(PREV_SKIPPED_ACTION_START_KEY)
+    has_obs = JOINT_STATE_KEY in frame and all(key in frame for key in CAMERA_SLOTS)
+    if not has_obs:
+        LOGGER.warning("EXPO-FT: episode ended without a terminal observation")
+    return expo.on_done(
+        _decode_images(frame) if has_obs else None,
+        _wire_state_25(frame[JOINT_STATE_KEY].astype(np.float32)) if has_obs else None,
+        None if prev is None else int(prev),
+        str(frame.get(DONE_REASON_KEY, "") or ""),
+    )
+
+
 def server_handshake_config(
     *, server_features: Iterable[str | ServerFeature] = (),
 ) -> ServerHandshake:
@@ -717,7 +858,9 @@ async def handle_inference_connection(
     await connection.send(serialize_to_msgpack(cfg.to_payload()))
 
     rtc = _RtcState()
+    kv = _KvEmaState()
     rl_state = _RlState()
+    replay = opts.replay.new_state() if opts.replay is not None else None
     last_prompt: str | None = None
     last_metadata: str | None = None
     held_prompt: str | None = None
@@ -744,6 +887,10 @@ async def handle_inference_connection(
             continue
         endpoint = frame.get(ENDPOINT_KEY)
         if endpoint == ENDPOINT_DONE:
+            if opts.expo is not None:
+                # Blocks until the operator labels the episode and the per-episode updates
+                # finish: the robot cannot start the next episode before then.
+                await asyncio.to_thread(_expo_episode_end, frame, opts.expo)
             if opts.rl is not None:
                 # Before held_prompt is cleared: the terminal observation belongs to the
                 # episode that just ended and is conditioned on its instruction.
@@ -751,6 +898,9 @@ async def handle_inference_connection(
                 await _rl_episode_end(frame, rl_state, opts.rl, prompt=terminal_prompt)
                 rl_state.reset()
             rtc.reset()
+            kv.reset()
+            if replay is not None:
+                replay.rewind()
             held_prompt = None
             await connection.send(serialize_to_msgpack({STATUS_KEY: "ok"}))
             continue
@@ -762,6 +912,15 @@ async def handle_inference_connection(
             LOGGER.info("intervention frame: dropping the last chunk; the next request "
                         "starts a fresh, unconditioned plan")
             rtc.reset()
+            kv.reset()
+            if replay is not None:
+                replay.interrupt()
+            if opts.expo is not None:
+                prev = frame.get(PREV_SKIPPED_ACTION_START_KEY)
+                await asyncio.to_thread(
+                    opts.expo.on_intervention, _decode_images(frame),
+                    _wire_state_25(frame[JOINT_STATE_KEY].astype(np.float32)),
+                    np.asarray(frame[ACTION_KEY], np.float32), None if prev is None else int(prev))
             await connection.send(serialize_to_msgpack({STATUS_KEY: "ok"}))
             continue
         if endpoint is not None:
@@ -782,10 +941,12 @@ async def handle_inference_connection(
             last_prompt = prompt
         # The forward pass blocks for ~100 ms; run it off the event loop so websocket
         # pings keep flowing.
-        if opts.rl is not None:
+        if replay is not None:
+            resp = _replay_response(frame, replay, policy, opts, prompt=prompt)
+        elif opts.rl is not None:
             resp = await _inference_response_rl(frame, rl_state, policy, opts, prompt=prompt)
         else:
-            resp = await asyncio.to_thread(_inference_response, frame, rtc, policy, opts, prompt=prompt)
+            resp = await asyncio.to_thread(_inference_response, frame, rtc, policy, opts, prompt=prompt, kv=kv)
         await connection.send(serialize_to_msgpack(resp))
         if opts.one_shot:
             LOGGER.info("one-shot mode: sent one inference response; ignoring further requests")
@@ -803,7 +964,11 @@ async def run_server(
 ) -> AsyncIterator[str]:
     async def handler(connection: ServerConnection) -> None:
         LOGGER.info("connection from %s", connection.remote_address)
-        await handle_inference_connection(connection, policy, opts, server_features=server_features)
+        try:
+            await handle_inference_connection(connection, policy, opts, server_features=server_features)
+        finally:
+            if opts.expo is not None:
+                opts.expo.connection_closed()  # an unlabelled episode is discarded, as in dsrl_pi0
 
     async with websockets.serve(handler, host, port, max_size=None) as server:
         port = next(iter(server.sockets)).getsockname()[1]
@@ -820,9 +985,13 @@ def _warmup(policy: ChunkPolicy, *, rl: bool = False) -> None:
     images = {slot: np.zeros((h, w, 3), dtype=np.uint8) for slot in CAMERA_SLOTS.values()}
     state = np.zeros(DEFAULT_HARDWARE_MODEL.action_dim, dtype=np.float32)
 
+    # With --kv-ema-alpha one memory across both calls, so the first call compiles the
+    # unsmoothed start and the second the blend.
+    kv_kwargs = {"kv_memory": KvEmaMemory()} if getattr(policy, "kv_ema", None) is not None else {}
+
     def once() -> None:
         if not rl:
-            policy.predict(images, state, "warmup", prefix=None)
+            policy.predict(images, state, "warmup", prefix=None, **kv_kwargs)
             return
         backend = policy.latent_backend()
         _, cache = backend.prefix(openpi_obs(images, state, "warmup"))
@@ -866,8 +1035,26 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Policy inference server with an openpi (JAX) backend.")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=DEFAULT_INFERENCE_SERVER_PORT, help="Bind port")
-    parser.add_argument("--checkpoint-path", type=Path, required=True,
-                        help="openpi checkpoint step directory (holds params/ and assets/).")
+    parser.add_argument("--checkpoint-path", type=Path, default=None,
+                        help="openpi checkpoint step directory (holds params/ and assets/). "
+                        "Required unless --replay.")
+    parser.add_argument("--replay", type=Path, default=None, metavar="PATH",
+                        help="Replay a recorded joint trajectory (.rrd, or an .npz from "
+                        "scripts/extract_rrd_actions.py) on the robot instead of running a model. "
+                        "Requests are answered with consecutive slices of the recording's "
+                        "commanded joints; see server/trajectory_replay.py.")
+    parser.add_argument("--replay-hz", type=float, default=DEFAULT_REPLAY_HZ, metavar="HZ",
+                        help=f"Robot control rate the recording is resampled to (default: {DEFAULT_REPLAY_HZ:g}).")
+    parser.add_argument("--replay-start-s", type=float, default=0.0, metavar="S",
+                        help="Skip the recording's first S seconds (default: 0).")
+    parser.add_argument("--replay-end-s", type=float, default=None, metavar="S",
+                        help="Stop at S seconds into the recording, then hold (default: the end).")
+    parser.add_argument("--replay-approach-deg-s", type=float, default=DEFAULT_APPROACH_DEG_S,
+                        metavar="DEG_S", help="Peak joint speed of the ramp from the robot's pose to "
+                        f"the recording's, at start and after a resume (default: {DEFAULT_APPROACH_DEG_S:g}).")
+    parser.add_argument("--replay-extract-python", type=Path, default=DEFAULT_EXTRACT_PYTHON,
+                        metavar="PY", help="Python with rerun 0.30 used to read an .rrd "
+                        f"(default: {DEFAULT_EXTRACT_PYTHON}).")
     parser.add_argument("--asset-id", default=None,
                         help="Which assets/<asset id>/norm_stats.json to use (default: the only one).")
     parser.add_argument("--action-horizon", type=int, default=DEFAULT_ACTION_HORIZON,
@@ -900,8 +1087,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="Disable the per-chunk joint limits (on by default; see server.server).")
     parser.add_argument("--max-chunk-start-offset-deg", type=float, default=DEFAULT_MAX_START_OFFSET_DEG,
                         metavar="DEG", help=f"(default: {DEFAULT_MAX_START_OFFSET_DEG:g}; 0 disables)")
-    parser.add_argument("--max-step-deg", type=float, default=DEFAULT_MAX_STEP_DEG, metavar="DEG",
-                        help=f"(default: {DEFAULT_MAX_STEP_DEG:g}; 0 disables)")
+    parser.add_argument("--max-step-deg", type=float, default=None, metavar="DEG",
+                        help=f"(default: {DEFAULT_MAX_STEP_DEG:g}, or {DEFAULT_REPLAY_MAX_STEP_DEG:g} with "
+                        "--replay; 0 disables)")
     parser.add_argument("--limit-dims", nargs="*", default=[], metavar="DIM",
                         help="Action dims the limits apply to. Default: every joint dim, no grippers.")
     parser.add_argument("--no-rewards", action="store_true",
@@ -919,9 +1107,31 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                              f"{DEFAULT_RL_OBS_DUMP_ROOT}/<timestamp> per RL run.")
     parser.add_argument("--no-rl-obs-dump", action="store_true",
                         help="Do not write the RL observation dump (no offline latent resampling).")
+    parser.add_argument("--kv-ema-alpha", type=float, default=None, metavar="A",
+                        help="Experimental: smooth the prefix KV cache over the requests of one "
+                             "connection, m = A * kv + (1 - A) * m_prev (A in (0, 1]; 1 = stock "
+                             "output). Off by default. See server/openpi_kv_ema.py.")
+    parser.add_argument("--kv-ema-target", choices=KV_EMA_TARGETS, default="kv",
+                        help="Which half of the cache to smooth (default: kv = both).")
+    parser.add_argument("--kv-ema-tokens", choices=KV_EMA_TOKEN_MODES, default="images",
+                        help="'images' (default): camera-token positions only. 'all': also prompt "
+                             "positions whose token is unchanged since the previous request.")
+    parser.add_argument("--kv-ema-layers", type=int, nargs="*", default=None, metavar="L",
+                        help="Layers to smooth (default: all).")
     parser.add_argument("--rl-resize-image", type=int, default=DEFAULT_RL_RESIZE_IMAGE,
                         help=f"Edge of the square images sent to the RL agent (default: {DEFAULT_RL_RESIZE_IMAGE}).")
-    return parser.parse_args(argv)
+    try:  # EXPO-FT lives in the expo-ft repo; its flags exist only when it is on PYTHONPATH.
+        from expo_ft.ultra.server_hook import add_cli_args
+    except ImportError:
+        pass
+    else:
+        add_cli_args(parser)
+    args = parser.parse_args(argv)
+    if args.max_step_deg is None:
+        # Human teleop moves the wrists up to ~9 deg per 50 Hz step, three times what the
+        # policy limit allows; at 3 the replay lags its recording by up to ~28 deg.
+        args.max_step_deg = DEFAULT_REPLAY_MAX_STEP_DEG if args.replay is not None else DEFAULT_MAX_STEP_DEG
+    return args
 
 
 def _obs_dump_dir_from_args(args: argparse.Namespace, *, now: float | None = None) -> str | None:
@@ -962,6 +1172,18 @@ async def _run_cli(argv: Sequence[str] | None = None) -> int:
         "the first steps of the chunk, so the executed actions are no longer the ones the agent's "
         "latent produced and the critic learns a mapping that does not exist"
     )
+    assert not (args.rl_agent_url and args.kv_ema_alpha is not None), (
+        "--kv-ema-alpha is not wired into the latent RL path (--rl-agent-url)"
+    )
+    if args.replay is not None:
+        return await _run_replay(args)
+    assert args.checkpoint_path is not None, "--checkpoint-path is required (unless --replay)"
+    kv_ema = None
+    if args.kv_ema_alpha is not None:
+        kv_ema = KvEmaConfig(
+            alpha=args.kv_ema_alpha, target=args.kv_ema_target, tokens=args.kv_ema_tokens,
+            layers=None if not args.kv_ema_layers else tuple(args.kv_ema_layers),
+        )
     policy = OpenpiChunkPolicy(
         args.checkpoint_path,
         rtc_train=args.rtc_train,
@@ -971,6 +1193,7 @@ async def _run_cli(argv: Sequence[str] | None = None) -> int:
         num_steps=args.num_steps,
         max_token_len=args.max_token_len,
         asset_id=args.asset_id,
+        kv_ema=kv_ema,
     )
     rl = None
     if args.rl_agent_url is not None:
@@ -981,7 +1204,17 @@ async def _run_cli(argv: Sequence[str] | None = None) -> int:
         rl = await init_rl(policy, args.rl_agent_url, resize_image=args.rl_resize_image,
                            obs_dump_dir=obs_dump_dir)
         _RUNTIME.append(rl)
-    _warmup(policy, rl=rl is not None)
+    expo = None
+    if getattr(args, "expo_ft", False):
+        assert rl is None, "--expo-ft and --rl-agent-url are mutually exclusive"
+        assert kv_ema is None, "--kv-ema-alpha is not wired into --expo-ft"
+        from expo_ft.ultra.server_hook import build_runtime, warmup
+
+        expo = build_runtime(args, policy, predict_lock=_PREDICT_LOCK,
+                             norm_stats_dir=_norm_stats_dir(args.checkpoint_path, args.asset_id))
+        warmup(expo)
+    else:
+        _warmup(policy, rl=rl is not None)
     opts = ServerOptions(
         action_horizon=args.action_horizon,
         task=args.task,
@@ -990,21 +1223,92 @@ async def _run_cli(argv: Sequence[str] | None = None) -> int:
         action_limits=_action_limits_from_args(args),
         one_shot=args.one_shot,
         rl=rl,
+        expo=expo,
     )
     if opts.action_limits is None:
         LOGGER.warning("ACTION LIMITER OFF: chunks go to the robot exactly as the policy emits them")
     if args.rtc_train and opts.resume_gap_s is None:
         LOGGER.warning("RESUME DETECTION OFF: a prefix sent after a pause will be conditioned on")
     features = () if args.no_rewards else (ServerFeature.REWARDS,)
+    if expo is not None:
+        features = (*features, ServerFeature.HUMAN_INTERVENTIONS)
     async with run_server(policy, opts, args.host, args.port, server_features=features) as url:
         print(
             f"Server listening on {url} (openpi, action_horizon={args.action_horizon}, "
             f"rtc_train={'on' if args.rtc_train else 'off'}, rl={'on' if rl else 'off'}, "
+            f"expo_ft={'on' if expo else 'off'}, "
+            f"kv_ema={kv_ema.describe() if kv_ema else 'off'}, "
             f"prompt={'--task ' + repr(args.task) if args.task else 'from requests'})",
             flush=True,
         )
         if args.host == "0.0.0.0":
             # 0.0.0.0 is a bind address, not one a client can dial.
+            for ip in _list_lan_ips():
+                print(f"  reachable at ws://{ip}:{args.port}/ws", flush=True)
+        await asyncio.Future()
+    return 0
+
+
+def _replay_config_from_args(args: argparse.Namespace) -> ReplayConfig:
+    assert args.replay_approach_deg_s > 0, "--replay-approach-deg-s must be positive"
+    trajectory = load_trajectory(
+        args.replay, hz=args.replay_hz, start_s=args.replay_start_s, end_s=args.replay_end_s,
+        extract_python=args.replay_extract_python,
+    )
+    return ReplayConfig(
+        trajectory=trajectory,
+        name=args.replay.name,
+        hz=args.replay_hz,
+        approach_speed=float(np.deg2rad(args.replay_approach_deg_s)),
+        resume_gap_s=args.resume_gap_s if args.resume_gap_s > 0 else None,
+    )
+
+
+async def _run_replay(args: argparse.Namespace) -> int:
+    """--replay: serve a recording instead of the model. Nothing model-side is loaded."""
+    conflicts = {
+        "--rtc-train": args.rtc_train, "--rl-agent-url": args.rl_agent_url,
+        "--kv-ema-alpha": args.kv_ema_alpha is not None,
+        "--expo-ft": getattr(args, "expo_ft", False),
+    }
+    used = [flag for flag, on in conflicts.items() if on]
+    assert not used, f"--replay serves a recording, not a model; drop {', '.join(used)}"
+    if args.checkpoint_path is not None:
+        LOGGER.warning("--replay: ignoring --checkpoint-path %s (no model is loaded)", args.checkpoint_path)
+    replay = _replay_config_from_args(args)
+    policy = ReplayPolicy(policy_id=f"replay:{replay.name}", action_horizon=args.action_horizon)
+    opts = ServerOptions(
+        action_horizon=args.action_horizon,
+        task=args.task,
+        prompt_source=args.prompt_source,
+        resume_gap_s=replay.resume_gap_s,
+        action_limits=_action_limits_from_args(args),
+        one_shot=args.one_shot,
+        replay=replay,
+    )
+    traj = replay.trajectory
+    steps = np.rad2deg(np.abs(np.diff(traj, axis=0)))
+    if opts.action_limits is None:
+        LOGGER.warning("ACTION LIMITER OFF: the recording goes to the robot exactly as logged")
+    elif opts.action_limits.max_step is not None:
+        dims = list(opts.action_limits.dims)
+        over = int((steps[:, dims] > np.rad2deg(opts.action_limits.max_step)).any(axis=1).sum())
+        if over:
+            LOGGER.warning("%d of the recording's %d steps move a joint faster than --max-step-deg %g "
+                           "(its fastest is %.1f deg/step); the limiter will slow those, so the robot "
+                           "lags the recording through them. --max-step-deg %.0f replays it exactly",
+                           over, len(steps), np.rad2deg(opts.action_limits.max_step),
+                           steps[:, dims].max(), np.ceil(steps[:, dims].max()))
+    features = () if args.no_rewards else (ServerFeature.REWARDS,)
+    async with run_server(policy, opts, args.host, args.port, server_features=features) as url:
+        print(
+            f"Server listening on {url} (REPLAY {args.replay} -> {len(traj)} steps, "
+            f"{len(traj) / replay.hz:.1f}s at {replay.hz:g} Hz, action_horizon={args.action_horizon}, "
+            f"approach {args.replay_approach_deg_s:g} deg/s, "
+            f"limiter={'on' if opts.action_limits else 'OFF'})",
+            flush=True,
+        )
+        if args.host == "0.0.0.0":
             for ip in _list_lan_ips():
                 print(f"  reachable at ws://{ip}:{args.port}/ws", flush=True)
         await asyncio.Future()
