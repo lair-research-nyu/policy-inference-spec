@@ -16,7 +16,9 @@ from policy_inference_spec.protocol import (
     ProtocolPayload,
     JOINT_STATE_KEY,
     MODEL_ID_KEY,
-    REWARD_ACTION_INDEX_KEY,
+    OBSERVATION_HISTORY_KEY,
+    OBSERVATION_HISTORY_TIMESTAMPS_KEY,
+    OBSERVATION_HISTORY_VALUES_KEY,
     REWARD_KEY,
     START_METADATA_KEY,
     SUBTASK_KEY,
@@ -158,6 +160,52 @@ def test_validate_wire_inference_request_frame_accepts_missing_table_view_image(
     assert TABLE_VIEW_IMAGE_KEY not in payload
 
 
+def test_validate_wire_inference_request_frame_accepts_timestamped_observation_history() -> None:
+    payload: Any = {
+        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
+        TASK_KEY: "",
+        SUBTASK_KEY: "",
+        MODEL_ID_KEY: "",
+        OBSERVATION_HISTORY_KEY: {
+            JOINT_STATE_KEY: {
+                OBSERVATION_HISTORY_TIMESTAMPS_KEY: [10, 20],
+                OBSERVATION_HISTORY_VALUES_KEY: np.zeros((2, DEFAULT_HARDWARE_MODEL.state_dim), dtype=np.float32),
+            },
+            "observation/images/main_image": {
+                OBSERVATION_HISTORY_TIMESTAMPS_KEY: [12, 22],
+                OBSERVATION_HISTORY_VALUES_KEY: [
+                    np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8),
+                    b"jpeg",
+                ],
+            },
+        },
+    }
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
+
+    validate_wire_inference_request_frame(payload)
+
+
+def test_validate_wire_inference_request_frame_rejects_misaligned_observation_history() -> None:
+    payload: Any = {
+        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
+        TASK_KEY: "",
+        SUBTASK_KEY: "",
+        MODEL_ID_KEY: "",
+        OBSERVATION_HISTORY_KEY: {
+            "observation/images/main_image": {
+                OBSERVATION_HISTORY_TIMESTAMPS_KEY: [10, 20],
+                OBSERVATION_HISTORY_VALUES_KEY: [b"jpeg"],
+            }
+        },
+    }
+    for camera in DEFAULT_HARDWARE_MODEL.cameras:
+        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
+
+    with pytest.raises(AssertionError, match="timestamps and values lengths"):
+        validate_wire_inference_request_frame(payload)
+
+
 def test_validate_wire_inference_request_frame_accepts_scalar_reward() -> None:
     payload: ProtocolPayload = {
         JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
@@ -170,36 +218,6 @@ def test_validate_wire_inference_request_frame_accepts_scalar_reward() -> None:
         payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
 
     validate_wire_inference_request_frame(payload)
-
-
-def test_validate_wire_inference_request_frame_accepts_reward_action_index() -> None:
-    payload: ProtocolPayload = {
-        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
-        TASK_KEY: "",
-        SUBTASK_KEY: "",
-        MODEL_ID_KEY: "",
-        REWARD_KEY: 1.25,
-        REWARD_ACTION_INDEX_KEY: 12,
-    }
-    for camera in DEFAULT_HARDWARE_MODEL.cameras:
-        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
-
-    validate_wire_inference_request_frame(payload)
-
-
-def test_validate_wire_inference_request_frame_rejects_out_of_range_reward_action_index() -> None:
-    payload: ProtocolPayload = {
-        JOINT_STATE_KEY: np.zeros(DEFAULT_HARDWARE_MODEL.state_dim, dtype=np.float32),
-        TASK_KEY: "",
-        SUBTASK_KEY: "",
-        MODEL_ID_KEY: "",
-        REWARD_ACTION_INDEX_KEY: 50,
-    }
-    for camera in DEFAULT_HARDWARE_MODEL.cameras:
-        payload[f"observation/{camera}"] = np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8)
-
-    with pytest.raises(AssertionError, match=REWARD_ACTION_INDEX_KEY):
-        validate_wire_inference_request_frame(payload)
 
 
 def test_validate_wire_inference_request_frame_accepts_start_metadata() -> None:

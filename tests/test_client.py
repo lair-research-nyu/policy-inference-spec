@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -33,11 +33,14 @@ from policy_inference_spec.protocol import (
     INFERENCE_TIME_KEY,
     JOINT_STATE_KEY,
     MODEL_ID_KEY,
+    OBSERVATION_HISTORY_KEY,
+    OBSERVATION_HISTORY_TIMESTAMPS_KEY,
+    OBSERVATION_HISTORY_VALUES_KEY,
     PREV_SKIPPED_ACTION_START_KEY,
     PREFIX_CHANGE_START_KEY,
+    POLICY_CONFIGURATION_KEY,
     POLICY_ID_KEY,
     Q_VALUE_KEY,
-    REWARD_ACTION_INDEX_KEY,
     REWARD_KEY,
     START_METADATA_KEY,
     SUBTASK_KEY,
@@ -140,6 +143,55 @@ async def test_predict_round_trip_with_mock_websocket() -> None:
 
 
 @pytest.mark.asyncio
+async def test_predict_jpeg_encodes_images_inside_observation_history() -> None:
+    cfg = serialize_to_msgpack(_server_handshake_payload())
+    resp = serialize_to_msgpack(
+        {
+            ACTION_KEY: np.zeros((1, DEFAULT_HARDWARE_MODEL.action_dim), dtype=np.float32),
+            POLICY_ID_KEY: "policy-1",
+        }
+    )
+    ws_mock = MagicMock()
+    ws_mock.recv = AsyncMock(side_effect=[cfg, resp])
+    ws_mock.send = AsyncMock()
+    ws_mock.close = AsyncMock()
+
+    async def fake_connect(*_a: object, **_kw: object) -> MagicMock:
+        return ws_mock
+
+    frame = _valid_wire_frame()
+    frame[OBSERVATION_HISTORY_KEY] = {
+        JOINT_STATE_KEY: {
+            OBSERVATION_HISTORY_TIMESTAMPS_KEY: [10, 20],
+            OBSERVATION_HISTORY_VALUES_KEY: np.zeros((2, DEFAULT_HARDWARE_MODEL.state_dim), dtype=np.float32),
+        },
+        "observation/images/main_image": {
+            OBSERVATION_HISTORY_TIMESTAMPS_KEY: [12, 22],
+            OBSERVATION_HISTORY_VALUES_KEY: [
+                np.zeros(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8),
+                np.ones(DEFAULT_HARDWARE_MODEL.image_resolution + (3,), dtype=np.uint8),
+            ],
+        },
+    }
+    with patch("policy_inference_spec.client.websockets.connect", side_effect=fake_connect):
+        client = RemotePolicyClient("ws://127.0.0.1:9/ws")
+        await client.predict(frame)
+        await client.aclose()
+
+    await_args = ws_mock.send.await_args
+    assert await_args is not None
+    sent_payload = deserialize_from_msgpack(await_args.args[0])
+    history = cast(Any, sent_payload[OBSERVATION_HISTORY_KEY])
+    assert isinstance(history, dict)
+    main_history = history["observation/images/main_image"]
+    assert isinstance(main_history, dict)
+    encoded_images = main_history[OBSERVATION_HISTORY_VALUES_KEY]
+    assert isinstance(encoded_images, list)
+    assert len(encoded_images) == 2
+    assert all(isinstance(image, bytes) for image in encoded_images)
+
+
+@pytest.mark.asyncio
 async def test_predict_includes_reward_when_server_supports_rewards() -> None:
     cfg = serialize_to_msgpack(_server_handshake_payload(rewards_enabled=True))
     resp = serialize_to_msgpack(
@@ -166,35 +218,6 @@ async def test_predict_includes_reward_when_server_supports_rewards() -> None:
     assert await_args is not None
     sent_payload = deserialize_from_msgpack(await_args.args[0])
     assert sent_payload[REWARD_KEY] == pytest.approx(2.5)
-
-
-@pytest.mark.asyncio
-async def test_predict_includes_reward_action_index_when_server_supports_rewards() -> None:
-    cfg = serialize_to_msgpack(_server_handshake_payload(rewards_enabled=True))
-    resp = serialize_to_msgpack(
-        {
-            ACTION_KEY: np.zeros((1, DEFAULT_HARDWARE_MODEL.action_dim), dtype=np.float32),
-            POLICY_ID_KEY: "policy-1",
-        }
-    )
-    ws_mock = MagicMock()
-    ws_mock.recv = AsyncMock(side_effect=[cfg, resp])
-    ws_mock.send = AsyncMock()
-    ws_mock.close = AsyncMock()
-
-    async def fake_connect(*_a: object, **_kw: object) -> MagicMock:
-        return ws_mock
-
-    with patch("policy_inference_spec.client.websockets.connect", side_effect=fake_connect):
-        client = RemotePolicyClient("ws://127.0.0.1:9/ws")
-        await client.predict(_valid_wire_frame(), reward=1.0, reward_action_index=7)
-        await client.aclose()
-
-    await_args = ws_mock.send.await_args
-    assert await_args is not None
-    sent_payload = deserialize_from_msgpack(await_args.args[0])
-    assert sent_payload[REWARD_KEY] == pytest.approx(1.0)
-    assert sent_payload[REWARD_ACTION_INDEX_KEY] == 7
 
 
 @pytest.mark.asyncio
@@ -303,7 +326,18 @@ async def test_predict_includes_prev_skipped_action_start() -> None:
 
 
 @pytest.mark.asyncio
-async def test_predict_preserves_start_metadata() -> None:
+@pytest.mark.parametrize(
+    "policy_configuration",
+    [
+        {},
+        {
+            "strategy": "ensemble",
+            "members": ["a", "b"],
+            "options": {"enabled": True, "temperature": 0.5, "fallback": None},
+        },
+    ],
+)
+async def test_predict_preserves_policy_configuration_and_start_metadata(policy_configuration: dict[str, Any]) -> None:
     cfg = serialize_to_msgpack(_server_handshake_payload())
     resp = serialize_to_msgpack(
         {
@@ -321,6 +355,7 @@ async def test_predict_preserves_start_metadata() -> None:
 
     frame = _valid_wire_frame()
     frame[START_METADATA_KEY] = {"item_index": 2, "pick_location": "table"}
+    frame[POLICY_CONFIGURATION_KEY] = policy_configuration
     with patch("policy_inference_spec.client.websockets.connect", side_effect=fake_connect):
         client = RemotePolicyClient("ws://127.0.0.1:9/ws")
         await client.predict(frame)
@@ -330,6 +365,16 @@ async def test_predict_preserves_start_metadata() -> None:
     assert await_args is not None
     sent_payload = deserialize_from_msgpack(await_args.args[0])
     assert sent_payload[START_METADATA_KEY] == {"item_index": 2, "pick_location": "table"}
+    assert sent_payload[POLICY_CONFIGURATION_KEY] == policy_configuration
+    assert frame[START_METADATA_KEY] == {"item_index": 2, "pick_location": "table"}
+
+
+@pytest.mark.parametrize("value", [None, "policy-a", [], {"nested": {"weights": b"binary"}}, {1: "value"}])
+def test_validate_wire_inference_request_frame_rejects_invalid_policy_configuration(value: Any) -> None:
+    frame = _valid_wire_frame()
+    frame[POLICY_CONFIGURATION_KEY] = value
+    with pytest.raises(AssertionError, match=POLICY_CONFIGURATION_KEY):
+        validate_wire_inference_request_frame(frame)
 
 
 @pytest.mark.asyncio

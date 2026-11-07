@@ -382,6 +382,7 @@ Optional request fields:
   never reach the server.
 - `reward`, `done`, `done_reason`, `prev_skipped_action_start`
 - `start_metadata`, `conditioning_metadata`
+- `policy_configuration`: a dictionary with string keys and JSON-like values (including nested objects/lists). Its schema belongs to the policy client/server. It is separate from workflow `start_metadata` and is also accepted on intervention frames.
 - `observation/hidden`, `observation/env`
 - `dumb_reward_goal_action_chunk` plus `dumb_reward_threshold`: optional debugging/reward fields.
 - `fast_mock_action_dim` plus `fast_mock_action_horizon`: optional testing fields.

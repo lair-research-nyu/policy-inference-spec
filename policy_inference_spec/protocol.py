@@ -11,7 +11,7 @@ else:
 
     class StrEnum(str, Enum):
         pass
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, TypedDict
 
 import numpy as np
 import numpy.typing as npt
@@ -22,6 +22,9 @@ DEFAULT_INFERENCE_SERVER_PORT = 18090
 JOINT_STATE_KEY = "observation/state"
 OBSERVATION_HIDDEN_KEY = "observation/hidden"
 OBSERVATION_ENV_KEY = "observation/env"
+OBSERVATION_HISTORY_KEY = "observation/history"
+OBSERVATION_HISTORY_TIMESTAMPS_KEY = "timestamps_ns"
+OBSERVATION_HISTORY_VALUES_KEY = "values"
 # Optional hardware camera (stations may omit table-view).
 TABLE_VIEW_IMAGE_KEY = "observation/images/table_view_image"
 
@@ -34,6 +37,7 @@ PREV_SKIPPED_ACTION_START_KEY = "prev_skipped_action_start"
 # Request metadata keys
 MODEL_ID_KEY = "model_id"
 POLICY_ID_KEY = "policy_id"
+POLICY_CONFIGURATION_KEY = "policy_configuration"
 TASK_KEY = "task"
 SUBTASK_KEY = "subtask"
 START_METADATA_KEY = "start_metadata"
@@ -47,7 +51,6 @@ ENDPOINT_TELEMETRY = "telemetry"
 
 # Reward and retrospective episode keys.
 REWARD_KEY = "reward"
-REWARD_ACTION_INDEX_KEY = "reward_action_index"
 REWARD_DESCRIPTION_KEY = "description"
 DONE_KEY = "done"
 DONE_REASON_KEY = "done_reason"
@@ -73,7 +76,15 @@ Q_VALUE_KEY = "q_value"
 InferenceMetadataValue: TypeAlias = None | str | int | float | bool | list[Any] | dict[str, Any]
 ImageArray: TypeAlias = npt.NDArray[np.uint8]
 FloatArray: TypeAlias = npt.NDArray[np.float32]
-ProtocolValue: TypeAlias = ImageArray | FloatArray | bytes | InferenceMetadataValue
+
+
+class TimestampedObservationSequence(TypedDict):
+    timestamps_ns: list[int]
+    values: FloatArray | list[ImageArray | bytes]
+
+
+ObservationHistory: TypeAlias = dict[str, TimestampedObservationSequence]
+ProtocolValue: TypeAlias = ImageArray | FloatArray | bytes | InferenceMetadataValue | ObservationHistory
 ProtocolPayload: TypeAlias = dict[str, ProtocolValue]
 
 
@@ -204,6 +215,10 @@ __all__ = [
     "INFERENCE_TIME_KEY",
     "InferenceMetadataValue",
     "JOINT_STATE_KEY",
+    "OBSERVATION_HISTORY_KEY",
+    "OBSERVATION_HISTORY_TIMESTAMPS_KEY",
+    "OBSERVATION_HISTORY_VALUES_KEY",
+    "ObservationHistory",
     "OBSERVATION_ENV_KEY",
     "OBSERVATION_HIDDEN_KEY",
     "TABLE_VIEW_IMAGE_KEY",
@@ -211,12 +226,12 @@ __all__ = [
     "N_EXTERNAL_CAMERAS_KEY",
     "NEEDS_WRIST_CAMERA_KEY",
     "POLICY_ID_KEY",
+    "POLICY_CONFIGURATION_KEY",
     "PREV_SKIPPED_ACTION_START_KEY",
     "PREFIX_CHANGE_START_KEY",
     "ProtocolPayload",
     "ProtocolValue",
     "Q_VALUE_KEY",
-    "REWARD_ACTION_INDEX_KEY",
     "REWARD_DESCRIPTION_KEY",
     "REWARD_KEY",
     "RL_ENABLED_KEY",
@@ -225,6 +240,7 @@ __all__ = [
     "STATUS_KEY",
     "SUBTASK_KEY",
     "TASK_KEY",
+    "TimestampedObservationSequence",
     "ServerFeature",
     "ServerHandshake",
     "make_server_handshake",

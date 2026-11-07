@@ -17,7 +17,6 @@ from policy_inference_spec.client_helpers import (
     _emit_server_error_verbatim,
     _log_server_config,
     _summarize_server_payload,
-    _wire_camera_names,
     policy_ws_url,
 )
 from policy_inference_spec.codec import deserialize_from_msgpack, encode_image, serialize_to_msgpack
@@ -36,9 +35,10 @@ from policy_inference_spec.protocol import (
     ENDPOINT_KEY,
     INFERENCE_TIME_KEY,
     JOINT_STATE_KEY,
+    OBSERVATION_HISTORY_KEY,
+    OBSERVATION_HISTORY_VALUES_KEY,
     PREV_SKIPPED_ACTION_START_KEY,
     Q_VALUE_KEY,
-    REWARD_ACTION_INDEX_KEY,
     REWARD_KEY,
     RL_ENABLED_KEY,
     SUBTASK_KEY,
@@ -52,7 +52,9 @@ LOGGER = logging.getLogger(__name__)
 
 def _validate_done_reason(*, done: bool, done_reason: str | None) -> str | None:
     if done:
-        assert isinstance(done_reason, str) and done_reason.strip(), "done_reason must be a non-empty str when done=True"
+        assert isinstance(done_reason, str) and done_reason.strip(), (
+            "done_reason must be a non-empty str when done=True"
+        )
         return done_reason.strip()
     assert done_reason is None, "done_reason must be None when done=False"
     return None
@@ -126,23 +128,25 @@ class RemotePolicyClient:
     def _headers(self) -> list[tuple[str, str]]:
         return [(k, v) for k, v in self._policy_auth_headers.items()]
 
-    def _warn_on_camera_name_mismatch(self, wire_frame: dict[str, Any]) -> None:
-        if self._server_config is None:
-            return
-        server_camera_names = self._server_config.camera_names
-        sent_camera_names = _wire_camera_names(wire_frame)
-        missing_camera_names = sorted(name for name in sent_camera_names if name not in set(server_camera_names))
-        if missing_camera_names:
-            LOGGER.warning(
-                "Sending camera names not present in server config. sent=%s missing=%s server_camera_names=%s",
-                sent_camera_names,
-                missing_camera_names,
-                sorted(server_camera_names),
-            )
-
     def _encode_wire_frame_images(self, wire_frame: dict[str, Any]) -> dict[str, Any]:
         adapted = dict(wire_frame)
         for key, value in wire_frame.items():
+            if key == OBSERVATION_HISTORY_KEY:
+                assert isinstance(value, dict), f"{OBSERVATION_HISTORY_KEY} must be dict"
+                history = {feature_key: dict(sequence) for feature_key, sequence in value.items()}
+                for feature_key, sequence in history.items():
+                    if feature_key == JOINT_STATE_KEY:
+                        continue
+                    values = sequence[OBSERVATION_HISTORY_VALUES_KEY]
+                    assert isinstance(values, list), f"{OBSERVATION_HISTORY_KEY}[{feature_key!r}] values must be list"
+                    sequence[OBSERVATION_HISTORY_VALUES_KEY] = [
+                        image_value
+                        if isinstance(image_value, bytes)
+                        else encode_image(_wire_image_to_hwc_uint8(image_value), jpeg_quality=75).data
+                        for image_value in values
+                    ]
+                adapted[key] = history
+                continue
             if not key.startswith("observation/") or key == JOINT_STATE_KEY or isinstance(value, bytes):
                 continue
             image = _wire_image_to_hwc_uint8(value)
@@ -235,7 +239,6 @@ class RemotePolicyClient:
         *,
         chunk_id: str | None = None,
         reward: float | None = None,
-        reward_action_index: int | None = None,
         done: bool = False,
         done_reason: str | None = None,
         prev_skipped_action_start: int | None = None,
@@ -255,14 +258,6 @@ class RemotePolicyClient:
                     LOGGER.warning(
                         "Dropping reward because server does not advertise %s support", ServerFeature.REWARDS
                     )
-            if reward_action_index is not None:
-                if self._server_config.supports(ServerFeature.REWARDS):
-                    wire_frame[REWARD_ACTION_INDEX_KEY] = int(reward_action_index)
-                else:
-                    LOGGER.warning(
-                        "Dropping reward_action_index because server does not advertise %s support",
-                        ServerFeature.REWARDS,
-                    )
             if prev_skipped_action_start is not None:
                 wire_frame[PREV_SKIPPED_ACTION_START_KEY] = int(prev_skipped_action_start)
             if done:
@@ -272,7 +267,6 @@ class RemotePolicyClient:
                 else:
                     LOGGER.warning("Dropping done because server does not advertise %s support", ServerFeature.REWARDS)
             validate_wire_inference_request_frame(wire_frame)
-            self._warn_on_camera_name_mismatch(wire_frame)
             payload = serialize_to_msgpack(wire_frame)
             start_time_ns = time.time_ns()
             async with self._lock:
@@ -314,7 +308,9 @@ class RemotePolicyClient:
         rl_enabled_raw = result.get(RL_ENABLED_KEY)
         rl_enabled = bool(rl_enabled_raw) if rl_enabled_raw is not None else None
         q_value_raw = result.get(Q_VALUE_KEY)
-        q_value = float(q_value_raw) if q_value_raw is not None else None
+        if q_value_raw is not None:
+            assert isinstance(q_value_raw, (int, float)), f"{Q_VALUE_KEY} must be numeric"
+        q_value = float(q_value_raw) if isinstance(q_value_raw, (int, float)) else None
         self._record_latency(total_latency_ms=total_latency_ms, server_latency_ms=server_latency_ms)
 
         actions_d = np.array(actions, dtype=np.float32)
@@ -332,7 +328,6 @@ class RemotePolicyClient:
         wire_frame: dict[str, Any],
         *,
         reward: float | None = None,
-        reward_action_index: int | None = None,
         done: bool = False,
         done_reason: str | None = None,
         task: str | None = None,
@@ -363,13 +358,10 @@ class RemotePolicyClient:
                 wire_frame[PREV_SKIPPED_ACTION_START_KEY] = int(prev_skipped_action_start)
             if reward is not None:
                 wire_frame[REWARD_KEY] = float(reward)
-            if reward_action_index is not None:
-                wire_frame[REWARD_ACTION_INDEX_KEY] = int(reward_action_index)
             if done:
                 wire_frame[DONE_KEY] = True
                 wire_frame[DONE_REASON_KEY] = done_reason
             validate_wire_intervention_request_frame(wire_frame)
-            self._warn_on_camera_name_mismatch(wire_frame)
             payload = serialize_to_msgpack(wire_frame)
             async with self._lock:
                 assert self._ws is not None
@@ -394,7 +386,8 @@ class RemotePolicyClient:
         final_wire_frame: dict[str, Any] | None = None,
         executed_steps: int | None = None,
     ) -> None:
-        done_reason = _validate_done_reason(done=True, done_reason=done_reason)
+        validated_done_reason = _validate_done_reason(done=True, done_reason=done_reason)
+        assert validated_done_reason is not None
         supplied = (final_wire_frame is not None, executed_steps is not None)
         assert all(supplied) or not any(supplied), "final_wire_frame and executed_steps must be supplied together"
         if final_wire_frame is not None:
@@ -403,11 +396,10 @@ class RemotePolicyClient:
             )
             payload = self._encode_wire_frame_images(final_wire_frame)
             validate_wire_inference_request_frame(payload)
-            self._warn_on_camera_name_mismatch(payload)
             payload[PREV_SKIPPED_ACTION_START_KEY] = int(executed_steps)
         else:
             payload = {}
-        payload.update({ENDPOINT_KEY: ENDPOINT_DONE, DONE_REASON_KEY: done_reason})
+        payload.update({ENDPOINT_KEY: ENDPOINT_DONE, DONE_REASON_KEY: validated_done_reason})
 
         # Only meaningful over the existing connection: reconnecting would create a
         # new server-side episode with no most-recent latent to close.

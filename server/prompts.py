@@ -22,7 +22,6 @@ from policy_inference_spec.protocol import (
     POLICY_ID_KEY,
     PREFIX_CHANGE_START_KEY,
     PREV_SKIPPED_ACTION_START_KEY,
-    REWARD_ACTION_INDEX_KEY,
     REWARD_KEY,
     START_METADATA_KEY,
     SUBTASK_KEY,
@@ -46,6 +45,9 @@ _PROMPT_METADATA_KEYS = (CONDITIONING_METADATA_KEY, START_METADATA_KEY)
 _PROMPT_FIELD_NAMES = (
     "instruction", "language_instruction", "prompt", "message", "text", "description",
 )
+
+# Upstream reverted this key (#45); older clients may still send it.
+REWARD_ACTION_INDEX_KEY = "reward_action_index"
 
 # Keys that change every request. They are worth logging in a per-request line, but not
 # in the metadata summary, whose whole value is that it only reappears when something

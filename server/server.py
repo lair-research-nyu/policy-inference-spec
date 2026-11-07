@@ -101,7 +101,6 @@ from policy_inference_spec.protocol import (
     PREFIX_CHANGE_START_KEY,
     PREV_SKIPPED_ACTION_START_KEY,
     Q_VALUE_KEY,
-    REWARD_ACTION_INDEX_KEY,
     REWARD_KEY,
     RL_ENABLED_KEY,
     START_METADATA_KEY,

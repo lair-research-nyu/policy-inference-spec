@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from policy_inference_spec.protocol import DEFAULT_INFERENCE_SERVER_PORT, JOINT_STATE_KEY, ServerHandshake
+from policy_inference_spec.protocol import DEFAULT_INFERENCE_SERVER_PORT, ServerHandshake
 from policy_inference_spec.hardware_model import (
     DEFAULT_HARDWARE_MODEL,
     HardwareModel,
@@ -28,15 +28,6 @@ def policy_ws_url(url: str) -> str:
 
 def _log_server_config(server_config: ServerHandshake) -> None:
     LOGGER.info("Received inference server config: %s", server_config.to_payload())
-
-
-def _wire_camera_names(wire_frame: dict[str, Any]) -> list[str]:
-    camera_names: list[str] = []
-    for key in wire_frame:
-        if not key.startswith("observation/") or key == JOINT_STATE_KEY:
-            continue
-        camera_names.append(key.removeprefix("observation/"))
-    return sorted(camera_names)
 
 
 def _truncate_log_value(value: Any, *, max_chars: int = 120) -> str:
